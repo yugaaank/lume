@@ -28,16 +28,19 @@
 
 use gpui::{
     Animated, AnyWindowHandle, Bounds, Context, Entity, Focusable, FocusHandle,
-    AnyElement, LinuxWindowBackground, Pixels, Render, Window, WindowBounds, WindowKind, WindowOptions,
+    AnyElement, LinuxWindowBackground, Pixels, Render, Size, Window, WindowBounds, WindowKind,
+    WindowOptions,
     div,
     layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
     millis, prelude::*, px,
 };
+use std::sync::Arc;
 use std::time::Instant;
 
 pub mod background;
 pub mod bar;
 pub mod panel;
+pub mod picker;
 
 pub const SIDEBAR_WIDTH: f32 = 220.0;
 pub const DOCK_HEIGHT: f32 = 64.0;
@@ -367,8 +370,25 @@ impl Surfaces {
     fn open_one(cx: &mut gpui::App, kind: Kind, w: f32, h: f32) -> SurfaceHandle {
         let s = spec_for(kind, w, h);
 
+        // Shared with the 'static builder closure, which cannot borrow.
+        let initial_region: Arc<std::sync::Mutex<Vec<gpui::Bounds<gpui::Pixels>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let region_slot = initial_region.clone();
+
         match cx.open_window(window_options(kind, &s), move |_window, cx| {
-            cx.new(|cx| SurfaceView::new(kind, s.visible, cx))
+            let view = cx.new(|cx| {
+                SurfaceView::new(kind, s.visible, gpui::size(px(s.width), px(s.height)), cx)
+            });
+
+            // Seed the icon regions now, while a real App is in scope.
+            // `Entity::read` needs one, so it cannot be done from render().
+            if kind == Kind::Background {
+                *region_slot.lock().expect("region mutex poisoned") =
+                    view.read(cx).desktop.read(cx).input_regions();
+            }
+
+            view
         }) {
             Ok(handle) => {
                 let mut handle = SurfaceHandle {
@@ -383,7 +403,17 @@ impl Surfaces {
                 // WindowOptions has no input-region field, so a surface that
                 // maps hidden must be given an empty one here. Some(&[]) is
                 // "no input"; None would be "the whole surface".
-                if !s.visible {
+                let rects = initial_region.lock().expect("region mutex poisoned").clone();
+                if s.visible && !rects.is_empty() {
+                    // Icon rects only. Everything else on this surface stays
+                    // click-through, so a click aimed at a terminal reaches it.
+                    handle.pushed_region = Some(rects.clone());
+                    let w = handle.window.clone();
+                    let r = rects.clone();
+                    w.update(cx, |_, window, _| {
+                        window.set_input_region(Some(&r));
+                    });
+                } else if !s.visible {
                     handle.pushed_region = Some(vec![]);
                     let window = handle.window.clone();
                     window.update(cx, |_, window, _| {
@@ -418,18 +448,22 @@ pub struct SurfaceView {
     kind: Kind,
     focus: FocusHandle,
     bar: Entity<bar::BarView>,
+    desktop: Entity<background::Desktop>,
     slide: Option<Slide>,
 }
 
 impl SurfaceView {
-    fn new(kind: Kind, visible: bool, cx: &mut Context<Self>) -> Self {
-        // Only the bar has real content at this stage. Panels and the
-        // background are placeholders until stages 4 and 5.
+    fn new(kind: Kind, visible: bool, size: Size<Pixels>, cx: &mut Context<Self>) -> Self {
+        // The background carries the desktop: icons, context menu, picker.
+        // The bar carries its own content. Panels are placeholders until
+        // stage 5.
         let bar = cx.new(|cx| bar::BarView::new(cx));
+        let desktop = cx.new(|cx| background::Desktop::new(size, cx));
         Self {
             kind,
             focus: cx.focus_handle(),
             bar,
+            desktop,
             slide: if matches!(kind, Kind::Bar | Kind::Background) {
                 None
             } else {
