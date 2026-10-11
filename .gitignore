@@ -1,0 +1,14 @@
+# Build output. Keep the target dir off the home volume if /tmp is a small
+# tmpfs — a cold gpui build needs ~6 GB.
+/target/
+**/*.rs.bk
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local measurements are committed on purpose — see benchmarks/baseline.md.
+# Scratch files are not.
+*.tmp
