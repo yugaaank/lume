@@ -15,3 +15,5 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dirs.workspace = true
+services = { path = "../services" }
+tokio.workspace = true

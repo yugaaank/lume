@@ -1,9 +1,10 @@
 use gpui::{
-    App, Context, FocusHandle, Focusable, LinuxWindowBackground, Render, Window, WindowBounds,
-    WindowKind, WindowOptions, div,
+    App, Context, FocusHandle, Focusable, LinuxWindowBackground, Render, Stateful, Window,
+    WindowBounds, WindowKind, WindowOptions, StatefulInteractiveElement, div,
     layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
     prelude::*, px, rgb,
 };
+use services::compositor::Action;
 
 /// What a user writes in their compositor config to target this surface.
 ///
@@ -79,10 +80,10 @@ fn window_options(width: f32, height: f32) -> WindowOptions {
 /// immediately, with no roundtrip. Outputs arrive asynchronously from
 /// `wl_output` events, so `cx.displays()` is EMPTY inside that callback --
 /// `zwlr_layer_shell_v1` is bound, but `get_layer_surface` never fires and no
-/// surface appears. Verified: `displays at launch count=0`.
+/// surface appears. Measured: `displays at launch count=0`.
 ///
-/// Poll on the background executor until they show up. 200 x 10ms is a 2s
-/// ceiling; a machine that has not reported an output by then has none.
+/// Every surface added later must go through this same gate, or it will
+/// silently fail to appear.
 pub fn open_when_ready(cx: &mut App) {
     if !cx.displays().is_empty() {
         open(cx);
@@ -126,12 +127,9 @@ fn open(cx: &mut App) {
         // multi-monitor setup gets N bars stacked on monitor 1.
         options.display_id = Some(display.id());
 
-        // `LayerShellNotSupportedError` renders as "Compositor doesn't support
-        // zwlr_layer_shell_v1". Name the display; the user can act on that.
         if let Err(e) = cx.open_window(options, |_window, cx| cx.new(|cx| Bar::new(cx))) {
             // Inside a tracing macro the sigils bind names like `display`, so a
-            // variable with that name resolves to the macro helper, not the loop
-            // variable. Bind the id first.
+            // variable with that name resolves to the macro helper.
             let monitor = display.id();
             tracing::error!(?monitor, "could not open bar: {e}");
         }
@@ -140,13 +138,101 @@ fn open(cx: &mut App) {
 
 pub struct Bar {
     focus: FocusHandle,
+    workspaces: Vec<services::Workspace>,
+    active: Option<i64>,
 }
 
 impl Bar {
     fn new(cx: &mut Context<Self>) -> Self {
-        Self {
+        let state = cx.global::<services::AppState>().clone();
+
+        // One listener per bar, registered once. The CompositorService fans out
+        // internally; we are not adding a listener per workspace.
+        //
+        // `WeakEntity` + the is_none() break is what lets the loop end when the
+        // bar closes. Without it this task holds the surface alive forever.
+        let compositor = state.compositor.clone();
+
+        cx.spawn(async move |weak, cx: &mut gpui::AsyncApp| {
+            loop {
+                // notified_owned() so the permit survives moving across tasks;
+                // notified() borrows and cannot be held across an await.
+                compositor.changed().notified_owned().await;
+
+                // The bar is gone. Stop, or this task holds it alive forever.
+                if weak.upgrade().is_none() {
+                    break;
+                }
+
+                let _ = weak.update(cx, |bar, cx| {
+                    bar.refresh_from(&compositor);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        let mut bar = Self {
             focus: cx.focus_handle(),
-        }
+            workspaces: Vec::new(),
+            active: None,
+        };
+        // `compositor` moved into the spawn above; `state` is still ours.
+        bar.refresh_from(&state.compositor);
+        bar
+    }
+
+    /// Pull current state from the service. Takes the handle rather than a
+    /// Context so it works from both a sync context and an AsyncApp update.
+    fn refresh_from(&mut self, compositor: &services::CompositorService) {
+        // ArcSwap load: an atomic pointer read, never a lock.
+        self.workspaces = compositor.workspaces().as_ref().clone();
+        self.active = Some(compositor.active().id);
+    }
+
+    fn workspace_pips(&self) -> Vec<Stateful<gpui::Div>> {
+        self.workspaces
+            .iter()
+            .map(|ws| {
+                let is_active = self.active == Some(ws.id);
+                let id = ws.id;
+
+                div()
+                    // Stable per-workspace id. Inside a loop this is not
+                    // optional: without it every pip shares one global element
+                    // id and the hit-test tree is rebuilt every frame.
+                    .id(("lume-ws-pip", id as usize))
+                    .h(px(20.0))
+                    .px_2()
+                    .rounded(px(4.0))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .cursor_pointer()
+                    .bg(if is_active {
+                        gpui::hsla(0.0, 0.0, 1.0, 0.16)
+                    } else {
+                        gpui::hsla(0.0, 0.0, 0.0, 0.0)
+                    })
+                    .text_color(if is_active {
+                        rgb(0xf0f0f0)
+                    } else {
+                        rgb(0x909090)
+                    })
+                    .child(gpui::SharedString::from(ws.name.clone()))
+                    .on_click(move |_, _window, cx| {
+                        // Errors are logged, not surfaced. A failed switch is
+                        // recoverable and must not take the bar down with it.
+                        if let Err(e) =
+                            cx.global::<services::AppState>()
+                                .compositor
+                                .act(Action::FocusWorkspace { id })
+                        {
+                            tracing::warn!(?id, "workspace switch failed: {e:#}");
+                        }
+                    })
+            })
+            .collect()
     }
 }
 
@@ -177,6 +263,7 @@ impl Render for Bar {
             // text_size takes an AbsoluteLength, so it needs px(), not a bare
             // float.
             .text_size(px(12.0))
+            .child(div().flex().gap_1().children(self.workspace_pips()))
             .child(gpui::SharedString::from("lume"))
     }
 }

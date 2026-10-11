@@ -37,5 +37,9 @@ rust-embed = "8"
 opt-level = 2
 lto = "thin"
 codegen-units = 1
-panic = "abort"
 strip = true
+
+# NOTE: no `panic = "abort"`. It would shrink the binary slightly, but it turns
+# every panic in every thread into a full process abort. A shell that dies
+# because the tray helper thread panicked is worse than one that logs and
+# carries on, and unwind leaves the IPC socket and layer surfaces to clean up.

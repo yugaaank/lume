@@ -189,6 +189,7 @@ dependencies = [
  "gpui-ce",
  "gpui_ce_platform",
  "services",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

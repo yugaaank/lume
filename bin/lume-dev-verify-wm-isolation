@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Fails if a compositor is named outside crates/services/src/compositor/.
+#
+# The abstraction is only real if something enforces it. This is that something.
+# A gate you have never seen fire is a gate you do not trust, so break it once
+# on purpose before trusting it.
+set -uo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+
+fail=0
+COMPOSITOR_DIR='crates/services/src/compositor'
+
+# Plain grep, not `git grep`: the gate has to work on untracked files too,
+# otherwise it passes vacuously on exactly the new code most likely to leak.
+check() {
+  local label="$1" pattern="$2"; shift 2
+  local out
+  out=$(grep -rnE "$pattern" "$@" 2>/dev/null || true)
+  if [ -n "$out" ]; then
+    echo "wm-isolation: $label"
+    echo "$out"
+    fail=1
+  fi
+}
+
+# 1. Compositor CLI tools and session handles.
+#
+# `main.rs` is excluded on purpose: it is the CLI entry point and must
+# construct the client side of the protocol. It names no compositor — it
+# forwards opaque strings to `send()`.
+check "compositor IPC referenced outside $COMPOSITOR_DIR" \
+  'hyprctl|HYPRLAND_INSTANCE_SIGNATURE|hl\.dsp\.|\.socket2\.sock' \
+  crates --exclude-dir=compositor
+
+# 2. Compositor name used in a comparison or match arm.
+check "compositor name in a comparison or match" \
+  '\b(is_hyprland|is_niri|is_sway)\b|match[[:space:]]+.*\b(Hyprland|Niri|Sway)\b' \
+  crates --include='*.rs'
+
+# 3. A capability identifier that names a compositor.
+check "capability identifier names a compositor" \
+  'const[[:space:]]+[A-Z_]*(HYPRLAND|NIRI|SWAY|WAYFIRE)[A-Z_]*[[:space:]]*:' \
+  crates --include='*.rs'
+
+if [ "$fail" -ne 0 ]; then
+  cat <<'EOF'
+
+The fix is almost never to add an exception to this script. It is that
+something wants to be a capability, or a semantic Action variant.
+
+  "this compositor cannot do X" is a capability flag on the backend.
+  "do X" is an Action the caller invokes without knowing the compositor.
+EOF
+  exit 1
+fi
+
+echo "wm-isolation: ok"
