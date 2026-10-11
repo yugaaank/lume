@@ -6,6 +6,7 @@
 pub mod apps;
 pub mod compositor;
 pub mod config;
+pub mod icons;
 pub mod ipc;
 
 pub use compositor::{Action, CompositorService, Workspace};

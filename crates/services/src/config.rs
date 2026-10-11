@@ -24,6 +24,50 @@ use std::sync::Arc;
 pub struct Config {
     pub appearance: Appearance,
     pub bar: Bar,
+    pub desktop: Desktop,
+    pub dock: Dock,
+}
+
+/// Dock contents.
+///
+/// Pinned desktop-file ids. Running apps appear here too, but only once we
+/// have a window event stream to populate them — stage 5.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Dock {
+    pub pinned: Vec<String>,
+    /// Show the dock at all.
+    pub enabled: bool,
+    /// Hide until the pointer reaches the screen edge.
+    pub autohide: bool,
+}
+
+impl Default for Dock {
+    fn default() -> Self {
+        Self { pinned: Vec::new(), enabled: true, autohide: false }
+    }
+}
+
+/// Desktop icon configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Desktop {
+    /// Desktop-file ids to show as icons, in order. An empty list means the
+    /// desktop shows nothing, which is a perfectly normal setup — the
+    /// launcher is how you start things.
+    pub pinned: Vec<String>,
+    pub show_files: bool,
+}
+
+impl Default for Desktop {
+    fn default() -> Self {
+        // Two well-known entries so a fresh install shows something and the
+        // icon plumbing is visibly exercised rather than silently untested.
+        Self {
+            pinned: vec!["firefox_firefox.desktop".into(), "org.gnome.Terminal.desktop".into()],
+            show_files: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -78,6 +122,8 @@ impl Default for Config {
         Self {
             appearance: Appearance::default(),
             bar: Bar::default(),
+            desktop: Desktop::default(),
+            dock: Dock::default(),
         }
     }
 }
@@ -261,7 +307,7 @@ mod tests {
                 accent: "#ff0000".into(),
                 ..Default::default()
             },
-            bar: Bar::default(),
+            ..Default::default()
         };
         write_atomic(&path, &toml::to_string_pretty(&original).unwrap()).unwrap();
         let back: Config = load_toml(&path).unwrap();

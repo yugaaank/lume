@@ -81,9 +81,6 @@ impl Kind {
 struct Spec {
     layer: Layer,
     anchor: Anchor,
-    /// The zone to use AT CREATION. Hidden surfaces map with 0 so they reserve
-    /// nothing; `SurfaceHandle::zone` keeps the restore value.
-    zone: f32,
     keyboard: KeyboardInteractivity,
     width: f32,
     height: f32,
@@ -98,7 +95,6 @@ fn spec_for(kind: Kind, w: f32, h: f32) -> Spec {
             restore_zone: 0.0,
             layer: Layer::Background,
             anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            zone: 0.0,
             keyboard: KeyboardInteractivity::None,
             width: w,
             height: h,
@@ -108,7 +104,6 @@ fn spec_for(kind: Kind, w: f32, h: f32) -> Spec {
             restore_zone: bar::BAR_HEIGHT,
             layer: Layer::Top,
             anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
-            zone: 0.0,
             keyboard: KeyboardInteractivity::None,
             width: w,
             height: bar::BAR_HEIGHT,
@@ -118,8 +113,6 @@ fn spec_for(kind: Kind, w: f32, h: f32) -> Spec {
             restore_zone: DOCK_HEIGHT,
             layer: Layer::Top,
             anchor: Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            // Hidden at map time: reserve nothing.
-            zone: 0.0,
             keyboard: KeyboardInteractivity::OnDemand,
             width: w,
             height: DOCK_HEIGHT,
@@ -133,7 +126,6 @@ fn spec_for(kind: Kind, w: f32, h: f32) -> Spec {
             restore_zone: SIDEBAR_WIDTH,
             layer: Layer::Top,
             anchor: Anchor::BOTTOM | Anchor::LEFT,
-            zone: 0.0,
             keyboard: KeyboardInteractivity::OnDemand,
             width: SIDEBAR_WIDTH,
             height: h,
@@ -143,13 +135,22 @@ fn spec_for(kind: Kind, w: f32, h: f32) -> Spec {
             restore_zone: SIDEBAR_WIDTH,
             layer: Layer::Top,
             anchor: Anchor::BOTTOM | Anchor::RIGHT,
-            zone: 0.0,
             keyboard: KeyboardInteractivity::OnDemand,
             width: SIDEBAR_WIDTH,
             height: h,
             visible: false,
         },
     }
+}
+
+/// The zone to use AT CREATION.
+///
+/// Derived, never stored twice. A hidden surface maps with 0 so it reserves
+/// nothing; a visible one maps with its restore zone. Keeping these as two
+/// independent fields is how the bar once shipped with zone 0 and stopped
+/// pushing windows down.
+fn creation_zone(s: &Spec) -> f32 {
+    if s.visible { s.restore_zone } else { 0.0 }
 }
 
 fn window_options(kind: Kind, s: &Spec) -> WindowOptions {
@@ -165,7 +166,7 @@ fn window_options(kind: Kind, s: &Spec) -> WindowOptions {
             namespace: kind.app_id().to_string(),
             layer: s.layer,
             anchor: s.anchor,
-            exclusive_zone: Some(px(s.zone)),
+            exclusive_zone: Some(px(creation_zone(s))),
             exclusive_edge: None,
             margin: Some((px(0.0), px(0.0), px(0.0), px(0.0))),
             keyboard_interactivity: s.keyboard,
@@ -420,7 +421,7 @@ impl Surfaces {
                         window.set_input_region(Some(&[]));
                     });
                 }
-                handle.pushed_zone = Some(px(s.zone));
+                handle.pushed_zone = Some(px(creation_zone(&s)));
 
                 tracing::info!(app_id = kind.app_id(), visible = s.visible, "mapped");
                 handle
@@ -449,6 +450,7 @@ pub struct SurfaceView {
     focus: FocusHandle,
     bar: Entity<bar::BarView>,
     desktop: Entity<background::Desktop>,
+    dock: Entity<panel::Dock>,
     slide: Option<Slide>,
 }
 
@@ -459,11 +461,13 @@ impl SurfaceView {
         // stage 5.
         let bar = cx.new(|cx| bar::BarView::new(cx));
         let desktop = cx.new(|cx| background::Desktop::new(size, cx));
+        let dock = cx.new(|cx| panel::Dock::new(cx));
         Self {
             kind,
             focus: cx.focus_handle(),
             bar,
             desktop,
+            dock,
             slide: if matches!(kind, Kind::Bar | Kind::Background) {
                 None
             } else {

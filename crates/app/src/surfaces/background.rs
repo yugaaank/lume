@@ -77,6 +77,10 @@ impl Grid {
 // ---------------------------------------------------------------- launch
 
 /// Launch an app. Parsed argv, exec'd directly. There is no shell.
+pub fn launch_public(app: &apps::AppEntry) {
+    launch(app)
+}
+
 fn launch(app: &apps::AppEntry) {
     let Some(argv) = app.argv(&[]) else {
         tracing::warn!(id = %app.id, "unusable Exec line");
@@ -132,13 +136,26 @@ impl Desktop {
         let state = cx.global::<AppState>().clone();
         let grid = Grid::for_display(display);
 
-        // TODO(stage4): this puts EVERY installed application on the
-        // desktop. That is wrong — the desktop should show files on
-        // ~/Desktop plus explicitly pinned apps, not 200 .desktop entries. It
-        // also means 200 input regions in one wl_region, which is a per-commit
-        // cost. Measured impact: +20M private dirty and idle CPU 0.10% ->
-        // 0.35%. Fix before this goes further.
-        let apps: Vec<apps::AppEntry> = state.apps.all().as_ref().clone();
+        // Only PINNED apps appear on the desktop. Listing every installed
+        // application was the previous behaviour and it was wrong twice over:
+        // nobody wants 200 icons on their desktop, and 200 rects in one
+        // wl_region is a per-commit cost. Measured: +20M private dirty and
+        // idle CPU 0.10% -> 0.35%.
+        //
+        // The set comes from config (`desktop.pinned`); the index supplies
+        // the metadata for whatever is named there.
+        let index = state.apps.all();
+        let pinned = &state.config.get().desktop.pinned;
+        let apps: Vec<apps::AppEntry> = pinned
+            .iter()
+            .filter_map(|id| index.iter().find(|a| &a.id == id).cloned())
+            .collect();
+
+        if apps.is_empty() {
+            tracing::info!(
+                "no pinned desktop icons; pin some in [desktop] pinned = [...]"
+            );
+        }
         let saved = state.config.icons();
 
         // Reconcile stored positions with the current app set. A stored cell
@@ -439,8 +456,10 @@ fn label(text: &str, width: f32) -> gpui::Div {
 fn icon_tile(name: &str, size: Pixels) -> AnyElement {
     let name = name.trim();
 
-    if name.starts_with('/') && std::path::Path::new(name).exists() {
-        return gpui::img(name.to_string()).into_any_element();
+    // Resolve against the user's icon theme the way a GTK client does: search
+    // $XDG_DATA_DIRS/icons/<theme>, follow Inherits, fall back to hicolor.
+    if let Some(path) = services::icons::resolve(name) {
+        return gpui::img(path.to_string_lossy().into_owned()).into_any_element();
     }
 
     let initial = name
