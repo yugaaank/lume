@@ -1,7 +1,8 @@
-mod bar;
+mod surfaces;
 
 use gpui::App;
 use services::{AppState, Command, decode, handle_default, send, serve};
+
 
 fn main() -> anyhow::Result<()> {
     // Relative Exec= lines in .desktop files resolve against cwd. Set this
@@ -88,7 +89,7 @@ fn run_shell() -> anyhow::Result<()> {
             let compositor = state.compositor.clone();
             cx.set_global(state);
 
-            bar::open_when_ready(cx);
+            surfaces::Surfaces::open_when_ready(cx);
 
             // IPC is blocking, so it gets its own thread. It needs the tokio
             // runtime for anything async, and the guard is still alive here.
