@@ -59,6 +59,25 @@ chasing until five surfaces exist.
 
 RSS over two minutes went 127.2 M → 123.4 M. The allocator settling, not a leak.
 
+## Stage 2 — compositor added (2026-10-12)
+
+| | Stage 1 | Stage 2 | Delta |
+|---|---|---|---|
+| RSS | 124 M | 115 M | -9 M (allocator variance) |
+| PSS | 79 M | 92 M | +13 M |
+| **Private dirty** | **34 M** | **48 M** | **+14 M** |
+| Threads | 30 | 32 | +2 |
+| fds | 62 | 70 | +8 |
+| Children | 0 | 0 | — |
+| Idle CPU (60 s) | 0.15% | **0.15%** | unchanged |
+
+The +14 M private dirty is compositor state, the IPC socket, and two threads.
+
+**Correction:** stage 1's idle CPU was recorded as 0.00% from a 30 s sample.
+CPU ticks have 10 ms granularity and a cheap poll can be missed entirely in a
+30 s window. Over 60 s it is **0.15%** — about 12 `hyprctl` spawns per minute
+from the poll loop. That is the number to compare against from here.
+
 ## Method
 
 ```sh
@@ -73,9 +92,11 @@ echo "Threads  $(awk '/Threads/{print $2}' /proc/$pid/status)"
 echo "fds      $(ls /proc/$pid/fd | wc -l)"
 echo "Children $(pgrep -P $pid | wc -l)"
 
-a=$(awk '{print $14+$15}' /proc/$pid/stat); sleep 30
+# Sample for at least 60 s. CPU ticks have 10 ms granularity and a short
+# window can report 0.00% for a process that is actually working.
+a=$(awk '{print $14+$15}' /proc/$pid/stat); sleep 60
 b=$(awk '{print $14+$15}' /proc/$pid/stat)
-awk -v t=$((b-a)) -v h=$hz 'BEGIN{printf "Idle CPU %.2f%%\n",(t/h)/30*100}'
+awk -v t=$((b-a)) -v h=$hz 'BEGIN{printf "Idle CPU %.3f%%\n",(t/h)/60*100}'
 ```
 
 ## Leak checks
