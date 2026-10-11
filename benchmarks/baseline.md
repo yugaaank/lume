@@ -78,6 +78,37 @@ CPU ticks have 10 ms granularity and a cheap poll can be missed entirely in a
 30 s window. Over 60 s it is **0.15%** — about 12 `hyprctl` spawns per minute
 from the poll loop. That is the number to compare against from here.
 
+## Stage 3 — five-surface registry (2026-10-12)
+
+| | Stage 2 | Stage 3 |
+|---|---|---|
+| Private dirty | 48 M | **40 M** |
+| PSS | 92 M | 104 M |
+| RSS | 115 M | 128 M |
+| Threads | 32 | 33 |
+| fds | 70 | 118 |
+| Children | 0 | 0 |
+| Idle CPU (60 s) | 0.15% | **0.10%** |
+
+Private dirty went *down* with three more surfaces. That is allocator variance,
+not a saving — do not read a trend into one sample.
+
+fds nearly doubled: each layer surface brings a `wl_surface` and its buffers.
+
+### Inset proof
+
+```
+$ hyprctl monitors -j | jq '.[0].reserved'
+[0, 43, 0, 0]
+```
+
+Left, right and bottom are zero. The hidden dock and both sidebars reserve
+nothing, which is the whole point of the zone-0 + `Some(&[])` hide mechanism.
+
+Note the 43 is Ryoku's frame-edge, which was running at the same time. Two
+shells reserving the same edge is not negotiable — one wins. Do not run both
+when judging layout.
+
 ## Method
 
 ```sh
