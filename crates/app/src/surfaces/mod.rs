@@ -35,7 +35,7 @@ use gpui::{
     millis, prelude::*, px,
 };
 use gpui::rgb;
-use services::AppState;
+use services::{AppState, intent};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -127,10 +127,18 @@ fn spec_for(kind: Kind, w: f32, h: f32, dock_mode: panel::DockMode) -> Spec {
         // exclusive zone, so a TOP|LEFT sidebar would leave a gap under the
         // bar. Letting the bar paint over the sidebar's top strip is what most
         // shells look like anyway, and there is no height to keep in sync.
+        // Anchored to the FULL vertical axis, not BOTTOM|LEFT.
+        //
+        // A surface anchored to two adjacent edges is a corner, and a corner
+        // has no unambiguous exclusive edge: Hyprland accepts the zone and
+        // reserves nothing. Measured - `lume panel left` set open=true, the
+        // push happened, and `reserved` stayed [0, 32, 0, 64] with no left
+        // inset. TOP|BOTTOM|LEFT makes it a vertical strip, whose exclusive
+        // edge is unambiguously LEFT.
         Kind::SidebarLeft => Spec {
             restore_zone: SIDEBAR_WIDTH,
             layer: Layer::Top,
-            anchor: Anchor::BOTTOM | Anchor::LEFT,
+            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT,
             keyboard: KeyboardInteractivity::OnDemand,
             width: SIDEBAR_WIDTH,
             height: h,
@@ -139,7 +147,7 @@ fn spec_for(kind: Kind, w: f32, h: f32, dock_mode: panel::DockMode) -> Spec {
         Kind::SidebarRight => Spec {
             restore_zone: SIDEBAR_WIDTH,
             layer: Layer::Top,
-            anchor: Anchor::BOTTOM | Anchor::RIGHT,
+            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::RIGHT,
             keyboard: KeyboardInteractivity::OnDemand,
             width: SIDEBAR_WIDTH,
             height: h,
@@ -189,6 +197,13 @@ fn window_options(kind: Kind, s: &Spec) -> WindowOptions {
 #[allow(dead_code)]
 pub struct SurfaceHandle {
     window: AnyWindowHandle,
+    /// The root view of this surface.
+    ///
+    /// Held so a caller on the UI thread can reach the view's own state
+    /// without going through the window. An `Entity` is the safe handle here;
+    /// a raw `AnyWindowHandle` would be a second owner of visibility, and two
+    /// owners of an exclusive zone is how the bar once reserved nothing.
+    view: Entity<SurfaceView>,
     kind: Kind,
     zone: f32,
     visible: bool,
@@ -200,6 +215,13 @@ pub struct SurfaceHandle {
 impl SurfaceHandle {
     pub fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// The sidebar this surface shows, if it is one.
+    ///
+    /// Takes an `App` because reading an entity's state needs an app context.
+    pub fn sidebar(&self, cx: &mut gpui::App) -> Option<Entity<panel::Sidebar>> {
+        self.view.read(cx).sidebar.clone()
     }
     pub fn is_visible(&self) -> bool {
         self.visible
@@ -216,10 +238,10 @@ impl SurfaceHandle {
         let region: Option<Vec<Bounds<Pixels>>> = if visible { None } else { Some(vec![]) };
 
         let window = self.window.clone();
-        window.update(cx, |_, window, _| {
+        report(window.update(cx, |_, window, _| {
             window.set_exclusive_zone(zone);
             window.set_input_region(region.as_deref());
-        });
+        }));
         self.pushed_zone = Some(zone);
         self.pushed_region = region;
         tracing::debug!(kind = ?self.kind, visible, "visibility changed");
@@ -233,9 +255,9 @@ impl SurfaceHandle {
         }
         self.pushed_region = Some(rects.clone());
         let window = self.window.clone();
-        window.update(cx, |_, window, _| {
+        report(window.update(cx, |_, window, _| {
             window.set_input_region(Some(&rects));
-        });
+        }));
     }
 }
 
@@ -274,6 +296,86 @@ impl Slide {
     pub fn sample(&mut self, now: Instant) -> (f32, bool) {
         let s = self.animated.sample(now);
         (s.value, s.is_active)
+    }
+}
+
+/// Surface mutations return a `Result` and it is easy to discard by accident,
+/// because the failure is a protocol error rather than a panic.
+///
+/// A dropped zone is exactly how the bar once reserved nothing: the code ran,
+/// looked correct, and said nothing. Every one goes through here so a failed
+/// commit is loud.
+fn report(result: anyhow::Result<()>) {
+    if let Err(e) = result {
+        tracing::error!("surface commit failed: {e:#}");
+    }
+}
+
+/// The sidebar views, reachable from an intent handler.
+///
+/// Entities, not window handles. An intent arrives from the IPC thread and
+/// lands here; it then goes through the same `set_open` the UI would have
+/// called, so there is still exactly one owner of a sidebar's visibility.
+#[derive(Clone)]
+pub struct Panels {
+    pub left: Entity<panel::Sidebar>,
+    pub right: Entity<panel::Sidebar>,
+}
+
+impl gpui::Global for Panels {}
+
+/// Apply one intent. The only place outside a view that may change one.
+pub fn apply_intent(cx: &mut gpui::App, intent: intent::Intent) {
+    match intent {
+        intent::Intent::Quit => {
+            tracing::info!("quit requested over IPC");
+            cx.quit();
+        }
+        intent::Intent::TogglePanel(side) => {
+            let state = cx.global::<AppState>();
+            let current = match side {
+                intent::Side::Left => state.config.get().panels.left,
+                intent::Side::Right => state.config.get().panels.right,
+            };
+            set_panel(cx, side, !current);
+        }
+        intent::Intent::SetPanel { side, open } => set_panel(cx, side, open),
+    }
+}
+
+/// Write the config, then tell the view. Config first: a view that repainted
+/// from a config change nobody can see is worse than one frame of lag.
+fn set_panel(cx: &mut gpui::App, side: intent::Side, open: bool) {
+    let state = cx.global::<AppState>();
+
+    let result = state.config.update(|c| match side {
+        intent::Side::Left => c.panels.left = open,
+        intent::Side::Right => c.panels.right = open,
+    });
+
+    if let Err(e) = result {
+        // A failed write means the panel would revert on restart, so do not
+        // open it. Better a menu that did nothing than a setting that lies.
+        tracing::error!(side = side.as_str(), "could not persist panel state: {e:#}");
+        return;
+    }
+
+    // Cloned out before the update: holding the global borrow across
+    // `Entity::update` borrows `cx` twice and will not compile, and the
+    // Entity is a cheap handle.
+    let entity = match cx.try_global::<Panels>() {
+        Some(panels) => Some(match side {
+            intent::Side::Left => panels.left.clone(),
+            intent::Side::Right => panels.right.clone(),
+        }),
+        None => {
+            tracing::warn!(side = side.as_str(), "panel intent with no panels registered");
+            None
+        }
+    };
+
+    if let Some(entity) = entity {
+        entity.update(cx, |bar, cx| bar.set_open(open, cx));
     }
 }
 
@@ -361,6 +463,10 @@ impl Surfaces {
         .map(|kind| Self::open_one(cx, kind, w, h, dock_mode))
         .collect();
 
+        if let (Some(left), Some(right)) = (opened[3].sidebar(cx), opened[4].sidebar(cx)) {
+            cx.set_global(Panels { left, right });
+        }
+
         tracing::info!(
             surfaces = opened.len(),
             "registry up: {}",
@@ -391,6 +497,9 @@ impl Surfaces {
             Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let region_slot = initial_region.clone();
+        let view_slot: Arc<std::sync::Mutex<Option<Entity<SurfaceView>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let view_slot_for_builder = view_slot.clone();
 
         match cx.open_window(window_options(kind, &s), move |_window, cx| {
             let view = cx.new(|cx| {
@@ -409,11 +518,23 @@ impl Surfaces {
                     desktop.read(cx).input_regions();
             }
 
+            // Stashed so the caller can reach the view. `open_window` has to
+            // be handed the root entity itself, so the only way out is a slot.
+            *view_slot_for_builder
+                .lock()
+                .expect("view slot poisoned") = Some(view.clone());
+
             view
         }) {
             Ok(handle) => {
+                let view = view_slot
+                    .lock()
+                    .expect("view slot poisoned")
+                    .take()
+                    .expect("open_window did not run the builder");
                 let mut handle = SurfaceHandle {
                     window: handle.into(),
+                    view,
                     kind,
                     zone: s.restore_zone,
                     visible: s.visible,
@@ -431,15 +552,15 @@ impl Surfaces {
                     handle.pushed_region = Some(rects.clone());
                     let w = handle.window.clone();
                     let r = rects.clone();
-                    w.update(cx, |_, window, _| {
+                    report(w.update(cx, |_, window, _| {
                         window.set_input_region(Some(&r));
-                    });
+                    }));
                 } else if !s.visible {
                     handle.pushed_region = Some(vec![]);
                     let window = handle.window.clone();
-                    window.update(cx, |_, window, _| {
+                    report(window.update(cx, |_, window, _| {
                         window.set_input_region(Some(&[]));
-                    });
+                    }));
                 }
                 handle.pushed_zone = Some(px(creation_zone(&s)));
 
@@ -479,6 +600,8 @@ pub struct SurfaceView {
     bar: Option<Entity<bar::BarView>>,
     desktop: Option<Entity<background::Desktop>>,
     dock: Option<Entity<panel::Dock>>,
+    /// Exactly one of these, for the two sidebar surfaces.
+    sidebar: Option<Entity<panel::Sidebar>>,
     slide: Option<Slide>,
     /// What was last pushed to the compositor for this surface, so render
     /// stays pure in everything but the one place that must not be.
@@ -510,6 +633,11 @@ impl SurfaceView {
         let desktop =
             (kind == Kind::Background).then(|| cx.new(|cx| background::Desktop::new(size, cx)));
         let dock = (kind == Kind::Dock).then(|| cx.new(|cx| panel::Dock::new(cx)));
+        let sidebar = match kind {
+            Kind::SidebarLeft => Some(cx.new(|cx| panel::Sidebar::new(intent::Side::Left, cx))),
+            Kind::SidebarRight => Some(cx.new(|cx| panel::Sidebar::new(intent::Side::Right, cx))),
+            _ => None,
+        };
 
         let view = Self {
             kind,
@@ -517,6 +645,7 @@ impl SurfaceView {
             bar,
             desktop,
             dock,
+            sidebar,
             slide: if matches!(kind, Kind::Bar | Kind::Background) {
                 None
             } else {
@@ -581,6 +710,30 @@ impl Render for SurfaceView {
         // The dock is the one surface whose visibility is not a constant, so
         // it is the one surface that pushes state while rendering. Even here
         // the push is diffed: an unchanged zone and region cost nothing.
+        if let Some(sidebar) = self.sidebar.as_ref().map(|s| s.read(_cx)) {
+            let viewport = window.viewport_size();
+            let h = px(f32::from(viewport.height));
+            let width = px(SIDEBAR_WIDTH);
+            let x = match sidebar.side() {
+                intent::Side::Left => px(0.0),
+                intent::Side::Right => viewport.width - width,
+            };
+
+            // Hidden means no input anywhere: Some(&[]). Visible means the
+            // whole rectangle. Both are diffed against `pushed`.
+            let region = sidebar
+                .open()
+                .then(|| vec![gpui::Bounds::new(gpui::point(x, px(0.0)), gpui::size(width, h))]);
+
+            let want = Pushed { zone: px(sidebar.zone()), region };
+            if self.pushed.as_ref() != Some(&want) {
+                tracing::debug!(side = sidebar.side().as_str(), open = sidebar.open(), "sidebar push");
+                window.set_exclusive_zone(want.zone);
+                window.set_input_region(want.region.as_deref());
+                self.pushed = Some(want);
+            }
+        }
+
         if let Some(dock) = self.dock.as_ref().map(|d| d.read(_cx)) {
             let h = px(f32::from(window.viewport_size().height));
             let w = window.viewport_size().width;
@@ -631,14 +784,11 @@ impl Render for SurfaceView {
                 .expect("dock surface has a dock")
                 .clone()
                 .into_any_element(),
-            Kind::SidebarLeft | Kind::SidebarRight => div()
-                .id(("lume-panel-placeholder", self.kind.map_order() as usize))
-                .size_full()
-                .bg(gpui::hsla(0.10, 0.05, 0.09, 0.90))
-                .text_color(rgb(0x909090))
-                .text_size(px(11.0))
-                .p_3()
-                .child(gpui::SharedString::from("sidebar - stage 5"))
+            Kind::SidebarLeft | Kind::SidebarRight => self
+                .sidebar
+                .as_ref()
+                .expect("a sidebar surface has a sidebar")
+                .clone()
                 .into_any_element(),
         };
 

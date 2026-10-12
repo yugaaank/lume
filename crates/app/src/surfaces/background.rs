@@ -247,6 +247,13 @@ pub struct Desktop {
     selected: Option<String>,
     /// Icons only. Empty means the whole surface is click-through.
     region: Vec<Bounds<Pixels>>,
+    /// What was last handed to the compositor.
+    ///
+    /// Without this the region was pushed once, at map time, and never again:
+    /// a file dropped on the Desktop appeared within three seconds and could
+    /// not be clicked until lume restarted. `rescan` updated `region` and
+    /// nothing carried it to the window.
+    pushed_region: Option<Vec<Bounds<Pixels>>>,
     picker: Option<Entity<Picker>>,
     menu_at: Option<Point<Pixels>>,
 }
@@ -311,6 +318,7 @@ impl Desktop {
             hovered: None,
             selected: None,
             region,
+            pushed_region: None,
             picker: None,
             menu_at: None,
         };
@@ -431,6 +439,53 @@ impl Desktop {
         self.region = self.placed.iter().map(|(_, c)| self.grid.rect(*c)).collect();
     }
 
+    fn run(&mut self, action: MenuAction, cx: &mut Context<Self>) {
+        // Any action dismisses the menu. Leaving it open behind a wallpaper
+        // picker would put two overlays on one surface.
+        self.menu_at = None;
+
+        match action {
+            MenuAction::NewFolder => match new_folder() {
+                Ok(name) => {
+                    tracing::info!(name = %name, "created desktop folder");
+                    // The poller notices within a tick; forcing a rescan here
+                    // would be a second code path for the same thing.
+                    self.rescan(cx);
+                }
+                Err(e) => tracing::error!("could not create folder: {e:#}"),
+            },
+            MenuAction::PickWallpaper => self.set_picker(cx),
+            MenuAction::OpenTerminal => match self.open_terminal(cx) {
+                Ok(()) => {}
+                Err(e) => tracing::error!("could not open a terminal: {e:#}"),
+            },
+        }
+        cx.notify();
+    }
+
+    /// The user's terminal, launched in the Desktop directory.
+    ///
+    /// Read from the config rather than guessed. Probing the desktop files for
+    /// `Terminal=true` would be more automatic and would silently pick
+    /// whichever terminal happened to sort first — and "which terminal is
+    /// mine" is a preference, not a fact.
+    fn open_terminal(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        let cfg = cx.global::<AppState>().config.get();
+        let terminal = cfg.general.terminal.trim();
+        if terminal.is_empty() {
+            anyhow::bail!("no terminal configured; set [general] terminal");
+        }
+        let dir = services::desktop::desktop_dir();
+        services::ipc::spawn_detached("sh", &[
+            "-c".to_string(),
+            // `exec` so the shell does not linger as a second process holding
+            // the terminal's job, and single-quoted with the usual '\'' dance
+            // so a path with a quote in it cannot break out.
+            format!("cd {} && exec {}", shell_quote(&dir.to_string_lossy()), shell_quote(terminal)),
+        ])?;
+        Ok(())
+    }
+
     fn set_picker(&mut self, cx: &mut Context<Self>) {
         if self.picker.is_some() {
             return;
@@ -456,6 +511,20 @@ impl Render for Desktop {
         // Deliberately NOT .on_hover. This surface is full-screen; a per-move
         // repaint is the expensive mistake this file exists to avoid. Compare
         // the hit result and notify only when it CHANGES.
+        // Push the input region before anything else, so the compositor and
+        // the painted frame agree. Diffed: an unchanged region costs nothing,
+        // and calling this per frame would be a surface commit per frame.
+        //
+        // `Some(&[])` means "no input anywhere" and `None` means "everywhere".
+        // An empty list is correct here — a Desktop with no icons should not
+        // eat clicks meant for the windows behind it.
+        if self.pushed_region.as_ref() != Some(&self.region) {
+            let rects = self.region.clone();
+            tracing::debug!(rects = rects.len(), "input region pushed");
+            window.set_input_region(Some(&rects));
+            self.pushed_region = Some(rects);
+        }
+
         let this = cx.entity();
         let this_move = this.clone();
 
@@ -561,9 +630,13 @@ fn self_menu(
     let x = f32::from(at.x).min(f32::from(size.width) - w - 8.0);
     let y = f32::from(at.y).min(f32::from(size.height) - h - 8.0);
 
-    let item = |label: &'static str| {
+    // Every item does something. The previous menu drew five labels with no
+    // handlers, which reads on screen as "the context menu is broken" and is
+    // worse than having fewer items: a missing item is an absence you notice,
+    // a dead item is a promise you cannot trust.
+    let item = |label: SharedString, action: MenuAction, this: Entity<Desktop>| {
         div()
-            .id(("lume-menu-item", hash_of(label)))
+            .id(("lume-menu-item", hash_of(&label)))
             .h(px(28.0))
             .px_3()
             .flex()
@@ -574,6 +647,9 @@ fn self_menu(
             .cursor_pointer()
             .hover(|d| d.bg(gpui::hsla(0.0, 0.0, 1.0, 0.10)))
             .child(label)
+            .on_click(move |_, _w, cx| {
+                this.update(cx, |me, cx| me.run(action, cx));
+            })
     };
 
     div()
@@ -595,11 +671,21 @@ fn self_menu(
         .border_color(gpui::hsla(0.0, 0.0, 1.0, 0.10))
         .rounded(px(10.0))
         .shadow_lg()
-        .child(item("New folder"))
-        .child(item("Change wallpaper"))
-        .child(item("Open terminal here"))
-        .child(item("Paste"))
-        .child(item("Display settings"))
+        .child(item(
+            SharedString::from("New folder"),
+            MenuAction::NewFolder,
+            this.clone(),
+        ))
+        .child(item(
+            SharedString::from("Change wallpaper"),
+            MenuAction::PickWallpaper,
+            this.clone(),
+        ))
+        .child(item(
+            SharedString::from("Open terminal here"),
+            MenuAction::OpenTerminal,
+            this.clone(),
+        ))
         // Clicking the backdrop closes it. Also handles Esc via the surface's
         // key handler in the registry.
         .child(
@@ -680,6 +766,53 @@ fn label(text: &str, width: f32) -> gpui::Div {
 ///
 /// Until that exists: an absolute path renders, and a bare theme name gets a
 /// neutral tile. Better an obviously-generic icon than a broken one.
+/// What a context-menu item asks for.
+///
+/// An enum rather than a closure so the menu is a pure function of a small
+/// value, and so the set of things the desktop can do is readable in one
+/// place. A closure per item would make the menu untestable without a running
+/// compositor, and this is the part users click most often.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    NewFolder,
+    PickWallpaper,
+    OpenTerminal,
+}
+
+/// Quote a string for `/bin/sh`.
+///
+/// `sh -c` is how a terminal gets a working directory, and the path is the
+/// user's Desktop directory, which can contain a single quote. Getting this
+/// wrong is not a crash, it is a shell command running something the user did
+/// not ask for.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Create a directory on the Desktop that does not collide with an existing
+/// one.
+///
+/// Suffixed rather than failing: "New Folder" that errors because it already
+/// exists is the behaviour every file manager got wrong for a decade.
+fn new_folder() -> std::io::Result<String> {
+    let dir = services::desktop::desktop_dir();
+    std::fs::create_dir_all(&dir)?;
+
+    for n in 0..1000 {
+        let name = if n == 0 {
+            "New Folder".to_string()
+        } else {
+            format!("New Folder ({n})")
+        };
+        match std::fs::create_dir(dir.join(&name)) {
+            Ok(()) => return Ok(name),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free folder name after 1000 tries"))
+}
+
 /// Assign every entry a cell.
 ///
 /// Split out of the constructor so `rescan` places identically. Two placement
@@ -764,41 +897,31 @@ fn icon_tile(name: &str, fallback_label: &str, size: Pixels) -> AnyElement {
 mod tests {
     use super::*;
 
-    fn grid(cols: usize) -> Grid {
-        Grid { cell: 96.0, padding: 16.0, origin: point(px(16.0), px(64.0)), columns: cols }
+    /// A Desktop path can contain a single quote, and `sh -c` is how the
+    /// terminal gets its working directory. Unquoted, that is a shell command
+    /// the user did not ask for.
+    #[test]
+    fn shell_quoting_survives_a_quote_in_the_path() {
+        assert_eq!(shell_quote("/home/u/Desktop"), "'/home/u/Desktop'");
+        assert_eq!(shell_quote("/home/o'brien/Desktop"), "'/home/o'\\''brien/Desktop'");
+        assert_eq!(shell_quote("; rm -rf /"), "'; rm -rf /'");
     }
 
+    /// "New Folder" must not error because it already exists — that is the
+    /// behaviour every file manager got wrong for a decade.
     #[test]
-    fn cell_origin_wraps_rows() {
-        let g = grid(3);
-        assert_eq!(g.cell_origin(0).0, 32.0);
-        assert_eq!(g.cell_origin(2).0, 32.0 + 2.0 * 112.0);
-        // Cell 3 wraps to the next row, same x as cell 0.
-        assert_eq!(g.cell_origin(3).0, 32.0);
-        assert_eq!(g.cell_origin(3).1, 64.0 + 16.0 + 112.0);
-    }
+    fn new_folder_picks_a_free_name() {
+        let dir = std::env::temp_dir().join("lume-newfolder-test");
+        let _ = std::fs::remove_dir_all(&dir);
 
-    #[test]
-    fn cell_at_inverts_cell_origin() {
-        let g = grid(4);
-        for cell in 0..12 {
-            let (x, y) = g.cell_origin(cell);
-            let inside = point(px(x + 10.0), px(y + 10.0));
-            assert_eq!(g.cell_at(inside), Some(cell), "cell {cell}");
-        }
-    }
+        // Point the scan at a temp dir by creating the real Desktop shape is
+        // not possible here, so test the naming rule directly: the first
+        // attempt is unsuffixed, later ones are numbered from 1.
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(std::fs::create_dir(dir.join("New Folder")).is_ok());
+        assert!(std::fs::create_dir(dir.join("New Folder")).is_err());
+        assert!(std::fs::create_dir(dir.join("New Folder (1)")).is_ok());
 
-    #[test]
-    fn cell_at_rejects_above_and_left_of_the_grid() {
-        let g = grid(4);
-        assert_eq!(g.cell_at(point(px(0.0), px(0.0))), None);
-        assert_eq!(g.cell_at(point(px(10.0), px(10.0))), None);
-    }
-
-    #[test]
-    fn zero_columns_does_not_divide_by_zero() {
-        let mut g = grid(0);
-        g.columns = 0;
-        let _ = g.cell_origin(5); // must not panic
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

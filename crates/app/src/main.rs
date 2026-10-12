@@ -31,15 +31,10 @@ fn main() -> anyhow::Result<()> {
 
 /// Forward a command to a running shell, or report that there is none.
 fn run_client(cmd: Command) -> anyhow::Result<()> {
-    // Re-serialise so the wire format and the parsed enum cannot drift.
-    let wire = match cmd {
-        Command::Ping => "ping".to_string(),
-        Command::Workspaces => "workspaces".to_string(),
-        Command::FocusWorkspace(id) => format!("workspace {id}"),
-        Command::ToggleSpecial => "toggle-special".to_string(),
-        Command::Quit => "quit".to_string(),
-        Command::Duplicate => return Ok(()),
-    };
+    // Re-serialised from the enum itself, so the wire format and the parsed
+    // type cannot drift. `Command::wire` is the single definition; the test
+    // below checks it against `decode`.
+    let wire = cmd.wire();
 
     match send(&wire)? {
         Some(reply) => {
@@ -71,6 +66,12 @@ fn run_shell() -> anyhow::Result<()> {
         .build()?;
     let _runtime_guard = runtime.enter();
 
+    // Created before the app so the IPC thread can be handed a sender and the
+    // UI thread the receiver. See services::intent for why intents exist at
+    // all rather than a global registry of window handles.
+    let (sender, mut receiver) = services::intent::channel();
+    let shared = std::sync::Arc::new(sender.clone());
+
     let app = gpui_platform::application();
 
     app.with_quit_mode(gpui::QuitMode::LastWindowClosed)
@@ -91,11 +92,25 @@ fn run_shell() -> anyhow::Result<()> {
 
             surfaces::Surfaces::open_when_ready(cx);
 
+            // Drain intents on the UI thread. This is the only place that
+            // touches the UI, and it is the reason the channel exists.
+            cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                // The receiver closes only when every sender is dropped,
+                // which happens when the IPC thread exits. Nothing else ends
+                // this loop.
+                while let Some(intent) = receiver.recv().await {
+                    cx.update(|cx| surfaces::apply_intent(cx, intent));
+                }
+            })
+            .detach();
+
             // IPC is blocking, so it gets its own thread. It needs the tokio
             // runtime for anything async, and the guard is still alive here.
             std::thread::spawn(move || {
                 let _entered = runtime.enter();
-                serve(compositor, handle_default);
+                serve(compositor, move |cmd, comp| {
+                    services::handle(cmd, comp, Some(&shared))
+                });
             });
         });
 
@@ -108,8 +123,8 @@ mod tests {
 
     #[test]
     fn client_wire_format_round_trips() {
-        // Whatever the client serialises must decode back to the same command,
-        // or a keybind silently does the wrong thing.
+        // Every command the CLI can be asked for. `Duplicate` is excluded: it
+        // is what decoding reports, never something a user sends.
         for cmd in [
             Command::Ping,
             Command::Workspaces,
@@ -117,16 +132,26 @@ mod tests {
             Command::FocusWorkspace(-99),
             Command::ToggleSpecial,
             Command::Quit,
+            Command::Panel(services::intent::Side::Left, None),
+            Command::Panel(services::intent::Side::Right, None),
+            Command::Panel(services::intent::Side::Left, Some(true)),
+            Command::Panel(services::intent::Side::Right, Some(false)),
         ] {
-            let wire = match cmd {
-                Command::Ping => "ping".to_string(),
-                Command::Workspaces => "workspaces".to_string(),
-                Command::FocusWorkspace(id) => format!("workspace {id}"),
-                Command::ToggleSpecial => "toggle-special".to_string(),
-                Command::Quit => "quit".to_string(),
-                Command::Duplicate => unreachable!(),
-            };
-            assert_eq!(decode(&wire).unwrap(), cmd, "round-trip failed for {wire}");
+            let wire = cmd.wire();
+            assert_eq!(
+                decode(&wire).unwrap(),
+                cmd,
+                "round-trip failed for {wire:?}"
+            );
         }
+    }
+
+    #[test]
+    fn panel_rejects_a_bad_side_rather_than_guessing() {
+        assert!(decode("panel up").is_err());
+        assert!(decode("panel left maybe").is_err());
+        assert!(decode("panel").is_err());
+        assert!(decode("panel left on").is_ok());
+        assert!(decode("panel right off").is_ok());
     }
 }

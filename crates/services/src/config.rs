@@ -26,6 +26,46 @@ pub struct Config {
     pub bar: Bar,
     pub desktop: Desktop,
     pub dock: Dock,
+    pub panels: Panels,
+    pub general: General,
+}
+
+/// Things that are not a panel.
+///
+/// Small on purpose. Each key here is a place where guessing wrong is worse
+/// than asking: the terminal to launch, and nothing else so far.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct General {
+    /// The terminal to open from the desktop context menu.
+    pub terminal: String,
+}
+
+impl Default for General {
+    fn default() -> Self {
+        // Empty, not a guess. Probing the desktop files for 
+        // would silently pick whichever terminal sorted first, and which
+        // terminal is yours is a preference, not a fact.
+        Self { terminal: String::new() }
+    }
+}
+
+/// Sidebar visibility.
+///
+/// Persisted rather than held in a widget, because the compositor owns the
+/// keybinds: `bind = $mod, TAB, exec, lume panel left` has to survive a
+/// restart and has to be readable from `hyprland.conf`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Panels {
+    pub left: bool,
+    pub right: bool,
+}
+
+impl Default for Panels {
+    fn default() -> Self {
+        Self { left: false, right: false }
+    }
 }
 
 /// When the dock is shown, and whether it reserves space.
@@ -152,6 +192,8 @@ impl Default for Config {
             bar: Bar::default(),
             desktop: Desktop::default(),
             dock: Dock::default(),
+            panels: Panels::default(),
+            general: General::default(),
         }
     }
 }

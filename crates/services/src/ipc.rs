@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
 
+use crate::intent;
+
 use crate::compositor::{Action, CompositorService, Workspace};
 
 pub fn socket_path() -> anyhow::Result<PathBuf> {
@@ -29,8 +31,36 @@ pub enum Command {
     FocusWorkspace(i64),
     ToggleSpecial,
     Quit,
+    /// Show or hide a sidebar.
+    Panel(intent::Side, Option<bool>),
     /// No command — the shell was already running.
     Duplicate,
+}
+
+impl Command {
+    /// The wire form.
+    ///
+    /// One function, used by the client that sends and by the test that checks
+    /// the round trip. When the client had its own copy of this mapping — as it
+    /// did — the test exercised its own duplicate and would have passed while
+    /// the two had drifted apart.
+    pub fn wire(&self) -> String {
+        match self {
+            Command::Ping => "ping".into(),
+            Command::Workspaces => "workspaces".into(),
+            Command::FocusWorkspace(id) => format!("workspace {id}"),
+            Command::ToggleSpecial => "toggle-special".into(),
+            Command::Quit => "quit".into(),
+            Command::Panel(side, None) => format!("panel {}", side.as_str()),
+            Command::Panel(side, Some(open)) => format!(
+                "panel {} {}",
+                side.as_str(),
+                if *open { "on" } else { "off" }
+            ),
+            // Never sent. `Duplicate` is a result of decoding, not a request.
+            Command::Duplicate => "duplicate".into(),
+        }
+    }
 }
 
 pub fn decode(line: &str) -> anyhow::Result<Command> {
@@ -50,6 +80,17 @@ pub fn decode(line: &str) -> anyhow::Result<Command> {
             Command::FocusWorkspace(id)
         }
         "toggle-special" => Command::ToggleSpecial,
+        "panel" => {
+            let side = intent::Side::parse(arg.context("usage: lume panel <left|right> [on|off]")?)
+                .context("usage: lume panel <left|right> [on|off]")?;
+            let open = match parts.next() {
+                None => None,
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                Some(other) => bail!("usage: lume panel <left|right> [on|off]; got {other:?}"),
+            };
+            Command::Panel(side, open)
+        }
         "quit" => Command::Quit,
         other => bail!("unknown command: {other}"),
     })
@@ -135,6 +176,19 @@ where
 }
 
 pub fn handle_default(cmd: Command, compositor: &CompositorService) -> String {
+    handle(cmd, compositor, None)
+}
+
+/// Handle a command, with somewhere to send UI intents if the caller has one.
+///
+/// `intents` is `None` in the CLI process, which is the right answer: the
+/// client half of the protocol is a separate process that must not be
+/// mutating the running shell's UI. It forwards and exits.
+pub fn handle(
+    cmd: Command,
+    compositor: &CompositorService,
+    intents: Option<&intent::Shared>,
+) -> String {
     match cmd {
         Command::Ping => "pong".to_string(),
         Command::Workspaces => {
@@ -158,6 +212,22 @@ pub fn handle_default(cmd: Command, compositor: &CompositorService) -> String {
             Ok(()) => "ok".to_string(),
             Err(e) => format!("error: {e:#}"),
         },
+        Command::Panel(side, open) => {
+            let Some(tx) = intents else {
+                return "error: no shell attached".into();
+            };
+            let intent = match open {
+                Some(open) => intent::Intent::SetPanel { side, open },
+                None => intent::Intent::TogglePanel(side),
+            };
+            // `false` means the UI thread is gone, which only happens during
+            // shutdown. Saying so beats a silent success.
+            if tx.send(intent) {
+                "ok".to_string()
+            } else {
+                "error: shell is shutting down".into()
+            }
+        }
         Command::ToggleSpecial => match compositor.act(Action::ToggleSpecialWorkspace) {
             Ok(()) => "ok".to_string(),
             Err(e) => format!("error: {e:#}"),

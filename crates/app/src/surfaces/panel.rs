@@ -14,12 +14,14 @@ use std::time::Duration;
 use gpui::{
     AnyElement, App, Context, FocusHandle, Focusable, IntoElement, Render,
     StatefulInteractiveElement, Window, div,
+    SharedString,
     prelude::*, px, rgb,
 };
 use services::apps::AppEntry;
 pub use services::config::DockMode;
 
-use super::DOCK_HEIGHT;
+use super::{DOCK_HEIGHT, SIDEBAR_WIDTH};
+use services::intent::Side;
 
 
 /// Floor on how long the dock may stay wrong if the event stream drops an
@@ -328,5 +330,90 @@ mod tests {
     fn hash_is_stable_for_the_same_input() {
         assert_eq!(hash_of("firefox_firefox.desktop"), hash_of("firefox_firefox.desktop"));
         assert_ne!(hash_of("a.desktop"), hash_of("b.desktop"));
+    }
+}
+// ---------------------------------------------------------------- sidebars
+
+/// A sidebar.
+///
+/// Same ownership rule as the dock: the view reads the config and pushes its
+/// own zone and input region, diffed, from `render`. A registry of window
+/// handles would be a second owner, and two owners of an exclusive zone is how
+/// the bar once ended up reserving nothing.
+pub struct Sidebar {
+    focus: FocusHandle,
+    side: Side,
+    open: bool,
+}
+
+impl Sidebar {
+    pub fn new(side: Side, cx: &mut Context<Self>) -> Self {
+        let cfg = cx.global::<services::AppState>().config.get();
+        let open = match side {
+            Side::Left => cfg.panels.left,
+            Side::Right => cfg.panels.right,
+        };
+        tracing::info!(side = side.as_str(), open, "sidebar");
+        Self { focus: cx.focus_handle(), side, open }
+    }
+
+    pub fn open(&self) -> bool {
+        self.open
+    }
+
+    pub fn side(&self) -> Side {
+        self.side
+    }
+
+    pub fn zone(&self) -> f32 {
+        if self.open {
+            SIDEBAR_WIDTH
+        } else {
+            0.0
+        }
+    }
+
+    /// Apply an intent. The caller has already written the config; this only
+    /// repaints.
+    pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.open != open {
+            self.open = open;
+            tracing::info!(side = self.side.as_str(), open, "sidebar toggled");
+            cx.notify();
+        }
+    }
+}
+
+impl Focusable for Sidebar {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for Sidebar {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let title = match self.side {
+            Side::Left => "Left sidebar",
+            Side::Right => "Right sidebar",
+        };
+
+        div()
+            .id(("lume-sidebar", self.side as usize))
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(gpui::hsla(0.10, 0.05, 0.09, 0.92))
+            .border_1()
+            .border_color(gpui::hsla(0.0, 0.0, 1.0, 0.08))
+            .child(SharedString::from(title))
+            .child(
+                gpui::div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x808080))
+                    .child(SharedString::from("stage 5")),
+            )
+            .into_any_element()
     }
 }

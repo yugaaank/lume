@@ -8,6 +8,7 @@ pub mod compositor;
 pub mod config;
 pub mod desktop;
 pub mod icons;
+pub mod intent;
 pub mod ipc;
 
 pub use compositor::{Action, CompositorService, Workspace};
@@ -52,3 +53,5 @@ impl AppState {
         })
     }
 }
+
+pub use ipc::handle;
