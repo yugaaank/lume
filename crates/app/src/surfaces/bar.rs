@@ -276,15 +276,21 @@ impl Render for BarView {
         // never disagree.
         self.rendered = self.status.clone();
 
-        let (left, right) = widgets::split_by_side(&self.widgets);
+        let (left, middle, right) = widgets::split_by_side(&self.widgets);
 
+        // Three equal columns rather than justify_between with three children.
+        //
+        // With justify_between the middle group is only centred when the two
+        // outer groups happen to be the same width, so the clock drifts left
+        // or right as widgets are added and removed. Equal columns make the
+        // middle region genuinely centred at any content width, which is the
+        // entire reason it is its own region.
         div()
             .id("lume-bar")
             .h_full()
             .w_full()
             .flex()
             .items_center()
-            .justify_between()
             .px_3()
             // Rgba has no .alpha(); alpha is the low byte of an rgba() hex or a
             // component of hsla().
@@ -294,6 +300,8 @@ impl Render for BarView {
             .text_size(px(12.0))
             .child(
                 div()
+                    .flex_1()
+                    .h_full()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -301,8 +309,21 @@ impl Render for BarView {
             )
             .child(
                 div()
+                    .flex_1()
+                    .h_full()
                     .flex()
                     .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .children(middle.iter().flat_map(|w| self.render_widget(w))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_end()
                     .gap_3()
                     .children(right.iter().flat_map(|w| self.render_widget(w))),
             )

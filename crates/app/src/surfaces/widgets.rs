@@ -54,7 +54,32 @@ pub enum Widget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Left,
+    /// Dead centre.
+    ///
+    /// Not a flexbox detail — a third region with its own rules. The clock is
+    /// here because a time readout is the one thing on a bar that reads as
+    /// deliberate when it is centred, and every tiling shell puts it there.
+    Middle,
     Right,
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Left => "left",
+            Side::Middle => "middle",
+            Side::Right => "right",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "left" => Some(Side::Left),
+            "middle" | "center" | "centre" => Some(Side::Middle),
+            "right" => Some(Side::Right),
+            _ => None,
+        }
+    }
 }
 
 impl Widget {
@@ -90,7 +115,8 @@ impl Widget {
     pub fn default_side(&self) -> Side {
         match self {
             Widget::Workspaces | Widget::Title => Side::Left,
-            Widget::Clock | Widget::Network | Widget::Volume | Widget::Battery => Side::Right,
+            Widget::Clock => Side::Middle,
+            Widget::Network | Widget::Volume | Widget::Battery => Side::Right,
         }
     }
 
@@ -134,23 +160,25 @@ pub fn parse_list(names: &[String]) -> (Vec<Widget>, Vec<UnknownWidget>) {
     (widgets, unknown)
 }
 
-/// Split into the two halves, preserving order within each.
+/// Split into the three regions, preserving order within each.
 ///
-/// `Workspaces` and `Title` are forced left and the status widgets forced
-/// right, because that is what each is *for*; the configured order decides
-/// the order within a side. A user listing `["clock", "workspaces"]` gets
-/// workspaces left and the clock right, which is the only reading that makes
-/// those two words mean anything.
-pub fn split_by_side(widgets: &[Widget]) -> (Vec<Widget>, Vec<Widget>) {
+/// Identity left, the clock centred, status right — because that is what each
+/// is *for*. The configured order decides the order within a region, so
+/// `["volume", "clock", "network"]` gives volume then network on the right and
+/// the clock alone in the middle.
+/// Group into the three regions, preserving order within each.
+pub fn split_by_side(widgets: &[Widget]) -> (Vec<Widget>, Vec<Widget>, Vec<Widget>) {
     let mut left = Vec::new();
+    let mut middle = Vec::new();
     let mut right = Vec::new();
     for w in widgets {
         match w.default_side() {
             Side::Left => left.push(w.clone()),
+            Side::Middle => middle.push(w.clone()),
             Side::Right => right.push(w.clone()),
         }
     }
-    (left, right)
+    (left, middle, right)
 }
 
 /// The widgets a config asks for, filtered to what this machine can show.
@@ -222,16 +250,53 @@ mod tests {
     #[test]
     fn sides_follow_the_convention_not_the_list_order() {
         let (widgets, _) = parse_list(&["clock".into(), "workspaces".into()]);
-        let (left, right) = split_by_side(&widgets);
+        let (left, middle, right) = split_by_side(&widgets);
         assert_eq!(left, vec![Widget::Workspaces]);
-        assert_eq!(right, vec![Widget::Clock]);
+        assert_eq!(middle, vec![Widget::Clock]);
+        assert!(right.is_empty());
     }
 
     #[test]
     fn order_within_a_side_is_the_configured_order() {
-        let (widgets, _) = parse_list(&["volume".into(), "clock".into(), "network".into()]);
-        let (_, right) = split_by_side(&widgets);
-        assert_eq!(right, vec![Widget::Volume, Widget::Clock, Widget::Network]);
+        let (widgets, _) = parse_list(&[
+            "volume".into(),
+            "clock".into(),
+            "network".into(),
+            "battery".into(),
+        ]);
+        let (_, middle, right) = split_by_side(&widgets);
+        assert_eq!(middle, vec![Widget::Clock]);
+        assert_eq!(right, vec![Widget::Volume, Widget::Network, Widget::Battery]);
+    }
+
+    /// Every widget must land in exactly one region. A widget that matched no
+    /// arm would simply not render, which looks like a broken widget rather
+    /// than a missing match.
+    #[test]
+    fn every_widget_lands_in_exactly_one_region() {
+        let all = [
+            Widget::Clock,
+            Widget::Workspaces,
+            Widget::Network,
+            Widget::Volume,
+            Widget::Battery,
+            Widget::Title,
+        ];
+        for w in &all {
+            let (left, middle, right) = split_by_side(std::slice::from_ref(w));
+            let placed = left.len() + middle.len() + right.len();
+            assert_eq!(placed, 1, "{} was not placed exactly once", w.name());
+        }
+    }
+
+    #[test]
+    fn side_names_round_trip() {
+        for s in [Side::Left, Side::Middle, Side::Right] {
+            assert_eq!(Side::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(Side::parse("centre"), Some(Side::Middle));
+        assert_eq!(Side::parse("center"), Some(Side::Middle));
+        assert_eq!(Side::parse("up"), None);
     }
 
     /// The config the user actually has must produce the widgets they expect.
@@ -254,7 +319,8 @@ mod tests {
     fn default_sides_are_sane() {
         assert_eq!(Widget::Workspaces.default_side(), Side::Left);
         assert_eq!(Widget::Title.default_side(), Side::Left);
-        for w in [Widget::Clock, Widget::Network, Widget::Volume, Widget::Battery] {
+        assert_eq!(Widget::Clock.default_side(), Side::Middle);
+        for w in [Widget::Network, Widget::Volume, Widget::Battery] {
             assert_eq!(w.default_side(), Side::Right, "{} should be on the right", w.name());
         }
     }
