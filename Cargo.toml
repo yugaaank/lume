@@ -44,6 +44,13 @@ image = "0.25"
 # a compiled TZif blob and reimplementing the rules is not the job.
 chrono = "0.4"
 
+# Fuzzy matching for the launcher, by the skim author. Scored subsequence
+# matching, so results order the way muscle memory expects rather than by
+# something invented here. nucleo (the wrapper with a parallel matcher) would
+# be the alternative; the launcher is a few hundred candidates, not a file
+# index, so the simpler matcher is the right size.
+nucleo-matcher = "0.3"
+
 [profile.release]
 opt-level = 2
 lto = "thin"

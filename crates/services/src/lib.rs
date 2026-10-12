@@ -6,11 +6,13 @@
 pub mod apps;
 pub mod compositor;
 pub mod battery;
+pub mod calc;
 pub mod clock;
 pub mod config;
 pub mod desktop;
 pub mod icons;
 pub mod intent;
+pub mod launcher;
 pub mod network;
 pub mod volume;
 pub mod wifi;
