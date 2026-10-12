@@ -6,6 +6,7 @@
 pub mod apps;
 pub mod compositor;
 pub mod config;
+pub mod desktop;
 pub mod icons;
 pub mod ipc;
 

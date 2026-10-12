@@ -81,6 +81,88 @@ pub fn launch_public(app: &apps::AppEntry) {
     launch(app)
 }
 
+/// Open a Desktop item.
+///
+/// Three destinations, one entry point, because the grid, the selection and
+/// the context menu all need this and must not each grow their own idea of
+/// what a folder is.
+fn open_item(item: &services::desktop::DesktopItem) {
+    match item {
+        services::desktop::DesktopItem::Dir { name, .. } => {
+            // The file manager is whatever the desktop says it is. Guessing
+            // `nautilus` would be wrong on every machine but one.
+            let dir = services::desktop::desktop_dir().join(name);
+            let _ = services::ipc::spawn_detached("xdg-open", &[dir.to_string_lossy().into_owned()]);
+        }
+        services::desktop::DesktopItem::Launcher { path, .. } => {
+            match launcher_entry(path) {
+                Some(entry) => launch(&entry),
+                None => {
+                    tracing::warn!(path = %path.display(), "launcher has no Exec line");
+                }
+            }
+        }
+        services::desktop::DesktopItem::File { path, .. } => {
+            let _ = services::ipc::spawn_detached(
+                "xdg-open",
+                &[path.to_string_lossy().into_owned()],
+            );
+        }
+    }
+}
+
+/// Parse a `.desktop` file that lives on the Desktop.
+///
+/// `Type=Link` files point at a URL with a `URL=` key rather than an `Exec=`,
+/// and are handled by handing the URL to `xdg-open`, which knows the protocol
+/// handlers. Treating them as `Exec` would launch a shell command made of a
+/// URL.
+fn launcher_entry(path: &std::path::Path) -> Option<apps::AppEntry> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut entry = apps::AppEntry {
+        id: path.to_string_lossy().into_owned(),
+        name: path.file_stem()?.to_string_lossy().into_owned(),
+        generic_name: String::new(),
+        exec: String::new(),
+        icon: String::new(),
+        terminal: false,
+        path: path.to_path_buf(),
+    };
+
+    let mut section_ok = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            // `Exec` is only meaningful in the main group. `Desktop Action`
+            // blocks have their own, and taking one would run the wrong thing.
+            section_ok = line == "[Desktop Entry]";
+            continue;
+        }
+        if !section_ok {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "Name" => entry.name = value.trim().to_string(),
+            "Exec" => entry.exec = value.trim().to_string(),
+            "Icon" => entry.icon = value.trim().to_string(),
+            "Terminal" => entry.terminal = value.trim() == "true",
+            "URL" => {
+                let url = value.trim().to_string();
+                if !url.is_empty() {
+                    let _ = services::ipc::spawn_detached("xdg-open", &[url]);
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (!entry.exec.is_empty()).then_some(entry)
+}
+
 fn launch(app: &apps::AppEntry) {
     let Some(argv) = app.argv(&[]) else {
         tracing::warn!(id = %app.id, "unusable Exec line");
@@ -116,13 +198,51 @@ pub fn set_wallpaper(path: &std::path::Path) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------------- state
 
+/// Anything the desktop can show, from either source.
+///
+/// One type rather than two parallel vectors: the grid, the hit testing, the
+/// region and the position store all key off a single id, and having an app
+/// path and a file path would mean two layouts that cannot be reasoned about
+/// together. Launching is the only place they genuinely differ, and that is a
+/// match arm in one function.
+#[derive(Clone)]
+enum Entry {
+    /// Pinned from `[desktop] pinned`.
+    App(apps::AppEntry),
+    /// Found in the Desktop directory.
+    Item(services::desktop::DesktopItem),
+}
+
+impl Entry {
+    fn id(&self) -> String {
+        match self {
+            Entry::App(a) => a.id.clone(),
+            Entry::Item(i) => i.id(),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Entry::App(a) => a.name.clone(),
+            Entry::Item(i) => i.label().to_string(),
+        }
+    }
+
+    fn icon(&self) -> String {
+        match self {
+            Entry::App(a) => a.icon.clone(),
+            Entry::Item(i) => i.icon_name().to_string(),
+        }
+    }
+}
+
 pub struct Desktop {
     focus: FocusHandle,
     grid: Grid,
     /// App id -> cell. Sorted by cell so layout is stable and rendering order
     /// is deterministic.
     placed: Vec<(String, usize)>,
-    apps: Vec<apps::AppEntry>,
+    entries: Vec<Entry>,
     hovered: Option<usize>,
     selected: Option<String>,
     /// Icons only. Empty means the whole surface is click-through.
@@ -144,9 +264,10 @@ impl Desktop {
         //
         // The set comes from config (`desktop.pinned`); the index supplies
         // the metadata for whatever is named there.
+        let cfg = state.config.get();
         let index = state.apps.all();
-        let pinned = &state.config.get().desktop.pinned;
-        let apps: Vec<apps::AppEntry> = pinned
+        let pinned = &cfg.desktop.pinned;
+        let mut apps: Vec<apps::AppEntry> = pinned
             .iter()
             .filter_map(|id| index.iter().find(|a| &a.id == id).cloned())
             .collect();
@@ -156,45 +277,92 @@ impl Desktop {
                 "no pinned desktop icons; pin some in [desktop] pinned = [...]"
             );
         }
+
+        // The Desktop directory, appended after the pinned apps so a pinned
+        // app keeps cell 0 and file positions do not shuffle when one is
+        // pinned or unpinned.
+        let from_dir = if cfg.desktop.show_files {
+            services::desktop::scan()
+        } else {
+            Vec::new()
+        };
+        tracing::info!(
+            dir = %services::desktop::desktop_dir().display(),
+            items = from_dir.len(),
+            "desktop directory scanned"
+        );
+
+        let entries: Vec<Entry> = apps
+            .drain(..)
+            .map(Entry::App)
+            .chain(from_dir.into_iter().map(Entry::Item))
+            .collect();
+
+        // Reconcile stored positions with the current item set. A stored cell
+        // that two items both claim is a tie; first come, first served.
         let saved = state.config.icons();
+        let (placed, region) = place(&entries, &saved, grid);
 
-        // Reconcile stored positions with the current app set. A stored cell
-        // that two apps both claim is a tie; first come, first served.
-        let mut used: Vec<usize> = Vec::new();
-        let mut placed: Vec<(String, usize)> = Vec::new();
-
-        for app in &apps {
-            let Some(cell) = saved.cells.get(&app.id).copied() else {
-                continue;
-            };
-            if !used.contains(&cell) {
-                used.push(cell);
-                placed.push((app.id.clone(), cell));
-            }
-        }
-        for app in &apps {
-            if placed.iter().any(|(id, _)| id == &app.id) {
-                continue;
-            }
-            let cell = (0..).find(|c| !used.contains(c)).unwrap_or(placed.len());
-            used.push(cell);
-            placed.push((app.id.clone(), cell));
-        }
-        placed.sort_by_key(|(_, c)| *c);
-
-        let region = placed.iter().map(|(_, c)| grid.rect(*c)).collect();
-
-        Self {
+        let out = Self {
             focus: cx.focus_handle(),
             grid,
             placed,
-            apps,
+            entries,
             hovered: None,
             selected: None,
             region,
             picker: None,
             menu_at: None,
-        }
+        };
+
+        // Watch the Desktop directory.
+        //
+        // A timer, not inotify. inotify would be the textbook answer and it
+        // needs a non-blocking fd driven from the event loop, which this fork
+        // does not expose without blocking a thread on read. One `read_dir`
+        // of a flat directory every few seconds is a handful of syscalls; the
+        // expensive part of a rescan is not the read, it is the repaint, and
+        // `rescan` returns early when nothing changed so there is no repaint.
+        //
+        // This is the only always-on timer in the shell besides the
+        // compositor's own.
+        let dir = services::desktop::desktop_dir();
+        cx.spawn(async move |weak, cx: &mut gpui::AsyncApp| {
+            let mut last = std::time::SystemTime::UNIX_EPOCH;
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+
+                // One `stat` before touching the entity.
+                //
+                // Going through `Entity::update` marks the containing window
+                // dirty, and this surface is full-screen — so polling it
+                // unconditionally repainted 1920x1200 twenty times a minute to
+                // discover nothing had changed. Measured: 0.117% idle CPU,
+                // essentially all of it this. The directory's mtime changes
+                // when an entry is added, removed or renamed, which is every
+                // case that matters here.
+                let Ok(meta) = std::fs::metadata(&dir) else { continue };
+                let Ok(modified) = meta.modified() else { continue };
+                if modified == last {
+                    continue;
+                }
+                last = modified;
+
+                if weak
+                    .update(cx, |me, cx| {
+                        me.rescan(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        out
     }
 
     /// The rectangles that accept input. Empty means invisible to the pointer.
@@ -205,12 +373,58 @@ impl Desktop {
         self.region.clone()
     }
 
-    fn entry(&self, id: &str) -> Option<&apps::AppEntry> {
-        self.apps.iter().find(|a| a.id == id)
+    fn entry(&self, id: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.id() == id)
     }
 
     fn cell_of(&self, id: &str) -> Option<usize> {
         self.placed.iter().find(|(x, _)| x == id).map(|(_, c)| *c)
+    }
+
+    /// Re-read the Desktop directory and rebuild the layout if it changed.
+    ///
+    /// Returns whether anything moved, so the caller can skip the notify. An
+    /// unchanged Desktop must not cost a repaint of a full-screen surface.
+    pub fn rescan(&mut self, cx: &mut Context<Self>) -> bool {
+        let state = cx.global::<services::AppState>();
+        let cfg = state.config.get();
+
+        let from_dir = if cfg.desktop.show_files {
+            services::desktop::scan()
+        } else {
+            Vec::new()
+        };
+        let index = state.apps.all();
+        let entries: Vec<Entry> = cfg
+            .desktop
+            .pinned
+            .iter()
+            .filter_map(|id| index.iter().find(|a| &a.id == id).cloned())
+            .map(Entry::App)
+            .chain(from_dir.into_iter().map(Entry::Item))
+            .collect();
+
+        let ids: Vec<String> = entries.iter().map(Entry::id).collect();
+        if ids == self.entries.iter().map(Entry::id).collect::<Vec<_>>() {
+            return false;
+        }
+
+        tracing::info!(items = entries.len(), "desktop changed");
+        let (placed, region) = self.layout(&entries, cx);
+        self.entries = entries;
+        self.placed = placed;
+        self.region = region;
+        cx.notify();
+        true
+    }
+
+    fn layout(
+        &self,
+        entries: &[Entry],
+        cx: &mut Context<Self>,
+    ) -> (Vec<(String, usize)>, Vec<Bounds<Pixels>>) {
+        let saved = cx.global::<services::AppState>().config.icons();
+        place(entries, &saved, self.grid)
     }
 
     fn refresh_region(&mut self) {
@@ -262,17 +476,17 @@ impl Render for Desktop {
         // --- icons -------------------------------------------------------
         layer = layer.children(self.placed.iter().map(|(id, cell)| {
             let cell = *cell;
-            let Some(app) = self.entry(id).cloned() else {
+            let Some(entry) = self.entry(id).cloned() else {
                 return div().id(("lume-icon-missing", hash_of(id)));
             };
 
-            let is_hovered = self.hovered == Some(cell);
-            let is_selected = self.selected.as_deref() == Some(app.id.as_str());
+            let entry_id = entry.id();
+            let is_selected = self.selected.as_deref() == Some(entry_id.as_str());
             let (x, y) = self.grid.cell_origin(cell);
             let grid = self.grid;
 
             div()
-                .id(("lume-icon", hash_of(&app.id)))
+                .id(("lume-icon", hash_of(&entry_id)))
                 .absolute()
                 .left(px(x))
                 .top(px(y))
@@ -289,17 +503,30 @@ impl Render for Desktop {
                     gpui::hsla(0.0, 0.0, 0.0, 0.0)
                 })
                 .rounded(px(8.0))
-                .child(icon_tile(&app.icon, px(48.0)))
-                .child(label(&app.name, grid.cell))
+                .child(icon_tile(&entry.icon(), &entry.label(), px(48.0)))
+                .child(label(&entry.label(), grid.cell))
+                // Select on the first click, open on the second.
+                //
+                // There is no `on_double_click` in this fork, so the count
+                // comes off the click event. Single click selects rather than
+                // launches on purpose: an icon you cannot select is an icon
+                // you cannot drag, rename or unpin.
                 .on_click({
                     let this = this.clone();
-                    let id = app.id.clone();
-                    move |_, _w, cx| {
-                        // Single click selects; launch is a separate affordance
-                        // rather than a surprise.
+                    let id = entry_id.clone();
+                    let opened = entry.clone();
+                    move |event, _w, cx| {
+                        let double = event.click_count() >= 2;
                         this.update(cx, |me, cx| {
-                            me.selected = Some(id.clone());
-                            cx.notify();
+                            if double {
+                                match &opened {
+                                    Entry::App(app) => launch(app),
+                                    Entry::Item(item) => open_item(item),
+                                }
+                            } else {
+                                me.selected = Some(id.clone());
+                                cx.notify();
+                            }
                         });
                     }
                 })
@@ -453,7 +680,53 @@ fn label(text: &str, width: f32) -> gpui::Div {
 ///
 /// Until that exists: an absolute path renders, and a bare theme name gets a
 /// neutral tile. Better an obviously-generic icon than a broken one.
-fn icon_tile(name: &str, size: Pixels) -> AnyElement {
+/// Assign every entry a cell.
+///
+/// Split out of the constructor so `rescan` places identically. Two placement
+/// functions would drift, and the drift would show up as icons jumping cells
+/// whenever the Desktop directory changed.
+fn place(
+    entries: &[Entry],
+    saved: &services::config::IconPositions,
+    grid: Grid,
+) -> (Vec<(String, usize)>, Vec<Bounds<Pixels>>) {
+    let mut used: Vec<usize> = Vec::new();
+    let mut placed: Vec<(String, usize)> = Vec::new();
+
+    for entry in entries {
+        let id = entry.id();
+        let Some(cell) = saved.cells.get(&id).copied() else {
+            continue;
+        };
+        if !used.contains(&cell) {
+            used.push(cell);
+            placed.push((id, cell));
+        }
+    }
+    for entry in entries {
+        let id = entry.id();
+        if placed.iter().any(|(x, _)| x == &id) {
+            continue;
+        }
+        let cell = (0..).find(|c| !used.contains(c)).unwrap_or(placed.len());
+        used.push(cell);
+        placed.push((id, cell));
+    }
+    placed.sort_by_key(|(_, c)| *c);
+
+    let region = placed.iter().map(|(_, c)| grid.rect(*c)).collect();
+    (placed, region)
+}
+
+/// An icon, or a letter tile when the theme has nothing for that name.
+///
+/// `fallback_label` is the *display* name, not the icon name. An unresolved
+/// icon is common and says nothing about the app: wine writes `Icon=` keys
+/// like `0CC0_hollow_knight.0` that point into the wine prefix and will never
+/// resolve in any icon theme. Taking the initial of the icon name renders a
+/// literal "0" on the desktop, which tells the user nothing and looks broken.
+/// The label's initial at least says which app it is.
+fn icon_tile(name: &str, fallback_label: &str, size: Pixels) -> AnyElement {
     let name = name.trim();
 
     // Resolve against the user's icon theme the way a GTK client does: search
@@ -464,12 +737,15 @@ fn icon_tile(name: &str, size: Pixels) -> AnyElement {
         return gpui::img(path).into_any_element();
     }
 
-    let initial = name
+    let initial = fallback_label
+        .trim()
         .chars()
-        .next()
+        .find(|c| c.is_alphanumeric())
         .unwrap_or('?')
         .to_uppercase()
-        .to_string();
+        .collect::<String>();
+
+    tracing::debug!(icon = %name, "icon not in theme; using letter tile");
 
     div()
         .size(size)

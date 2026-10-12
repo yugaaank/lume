@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -99,6 +99,12 @@ pub struct Appearance {
     pub font_family: String,
     /// When true, accent colours come from the wallpaper palette.
     pub follow_wallpaper: bool,
+    /// Icon theme, by freedesktop theme name ("MacTahoe-dark").
+    ///
+    /// `None` means "ask the desktop", which is the right default: a shell
+    /// that hardcodes an icon theme fights every other tool on the system.
+    /// See `icons::detect_theme` for the precedence.
+    pub icon_theme: Option<String>,
 }
 
 impl Default for Appearance {
@@ -108,6 +114,7 @@ impl Default for Appearance {
             accent: "#7aa2f7".into(),
             font_family: "Inter".into(),
             follow_wallpaper: true,
+            icon_theme: None,
         }
     }
 }
@@ -164,6 +171,33 @@ pub struct ConfigService {
     config: Arc<ArcSwap<Config>>,
     icons: Arc<ArcSwap<IconPositions>>,
     dir: PathBuf,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+/// The live config, readable without an `App` handle.
+///
+/// `icons::resolve` is called from render paths and from the icon resolver,
+/// neither of which should have to thread a `ConfigService` through. The
+/// service publishes here on load and on every update, so there is one copy
+/// and no second source of truth.
+///
+/// Publishing rather than sharing the service matters: a global holding a
+/// service handle would let unrelated code call `update()` and write the user's
+/// config from a render path.
+static CURRENT: OnceLock<ArcSwap<Config>> = OnceLock::new();
+
+fn current_slot() -> &'static ArcSwap<Config> {
+    CURRENT.get_or_init(|| ArcSwap::from_pointee(Config::default()))
+}
+
+/// The current config. Defaults before `ConfigService::load` has run, which is
+/// what the tests rely on.
+pub fn current() -> Arc<Config> {
+    current_slot().load_full()
+}
+
+fn publish(config: &Arc<Config>) {
+    current_slot().store(config.clone());
 }
 
 impl ConfigService {
@@ -176,11 +210,24 @@ impl ConfigService {
         let config = load_or_seed::<Config>(&dir.join("config.toml"), "config.toml")?;
         let icons = load_toml::<IconPositions>(&dir.join("desktop-icons.toml")).unwrap_or_default();
 
+        publish(&Arc::new(ArcSwap::from_pointee(config.clone())).load_full());
+
         Ok(Self {
             config: Arc::new(ArcSwap::from_pointee(config)),
             icons: Arc::new(ArcSwap::from_pointee(icons)),
             dir,
+            changed: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+
+    /// Fires after `update`, for views that must re-read.
+    ///
+    /// `notify_one`, not `notify_waiters`: a view that is between renders is
+    /// not a waiter, and a dropped "your config changed" is how a theme switch
+    /// silently needs a restart. Coalescing is correct here — the signal says
+    /// "go look", and looking twice is harmless.
+    pub fn changed(&self) -> Arc<tokio::sync::Notify> {
+        self.changed.clone()
     }
 
     /// Cheap: an atomic pointer load. Called from render().
@@ -206,6 +253,10 @@ impl ConfigService {
         f(&mut next);
         self.config.store(Arc::new(next.clone()));
         write_atomic(&self.dir.join("config.toml"), &toml::to_string_pretty(&next)?)?;
+        // Published AFTER the successful write. A failed write must not leave
+        // the running shell showing settings that are not on disk.
+        publish(&self.config.load_full());
+        self.changed.notify_one();
         Ok(())
     }
 

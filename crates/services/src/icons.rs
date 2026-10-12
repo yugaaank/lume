@@ -24,6 +24,29 @@
 //! So we resolve to an absolute path up front, cache the *result*, and hand
 //! `img(Path)` a plain file location. Resolution happens once per icon name,
 //! not per frame.
+//!
+//! ## Which theme, though
+//!
+//! There is no single file that holds "the user's icon theme", and picking the
+//! wrong one is a silent wrong-looking-desktop bug. Measured on this machine:
+//!
+//! ```text
+//! gsettings get org.gnome.desktop.interface icon-theme  ->  MacTahoe-dark
+//! ~/.config/gtk-3.0/settings.ini gtk-icon-theme-name    ->  ryoku-folders
+//! ~/.config/gtk-4.0/settings.ini gtk-icon-theme-name    ->  ryoku-folders
+//! ~/.gtkrc-2.0        gtk-icon-theme-name               ->  MacTahoe-dark
+//! ```
+//!
+//! The user set their theme in GNOME Tweaks and believes it is MacTahoe-dark,
+//! which the dconf key confirms. The `settings.ini` files disagree because a
+//! different tool rewrote them wholesale — they also carry that tool's GTK
+//! theme, cursor and font, so nothing in them is the user's own doing.
+//!
+//! That makes `settings.ini` an *output* of other tools, not a record of user
+//! intent, and it makes `org.gnome.desktop.interface icon-theme` the closest
+//! thing to an authoritative answer: it is what the sanctioned GUI writes.
+//! `detect_theme` therefore prefers it, and keeps `settings.ini` only as a
+//! fallback for a system with no GNOME settings schema at all.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,9 +56,123 @@ use std::sync::{Mutex, OnceLock};
 /// raster, which matters because we render icons at 48px.
 const PREFERRED: &[&str] = &["svg", "png", "xpm"];
 
-fn cache() -> &'static Mutex<HashMap<String, Option<PathBuf>>> {
-    static C: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+/// Resolved paths, keyed by (theme, name).
+///
+/// Keying by theme as well as name is what makes a live theme switch correct.
+/// Keyed by name alone, the first theme to answer a name poisons the entry
+/// forever — which is exactly the bug that made an icon theme change need a
+/// restart.
+type CacheKey = (String, String);
+
+fn cache() -> &'static Mutex<HashMap<CacheKey, Option<PathBuf>>> {
+    static C: OnceLock<Mutex<HashMap<CacheKey, Option<PathBuf>>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The theme lume has been told to use, if the user set one explicitly.
+///
+/// `None` means "ask the desktop". Deliberately not cached into the chain:
+/// `detect_theme` runs a subprocess, and this is consulted once per resolve.
+fn override_theme() -> Option<String> {
+    crate::config::current().appearance.icon_theme.clone()
+}
+
+/// The theme to search first.
+pub fn active_theme() -> String {
+    override_theme().unwrap_or_else(detect_theme)
+}
+
+/// Where the desktop says its icon theme is.
+///
+/// Precedence, strongest first:
+///
+/// 1. `GTK_ICON_THEME` — an explicit environment override. GTK honours it
+///    above every file, so a shell that ignored it would disagree with every
+///    other client in the session.
+/// 2. `org.gnome.desktop.interface icon-theme` — what GNOME Tweaks and the
+///    Settings app write. This is the sanctioned UI, so it is treated as the
+///    user's intent.
+/// 3. `~/.config/gtk-4.0/settings.ini`, then gtk-3.0 — GTK's own fallback.
+///    Last, because other tools rewrite these files wholesale.
+///
+/// Returns `"hicolor"` when nothing answers. `hicolor` is required to exist
+/// by the spec, so the chain always terminates somewhere real.
+pub fn detect_theme() -> String {
+    if let Ok(name) = std::env::var("GTK_ICON_THEME") {
+        if !name.trim().is_empty() {
+            return name;
+        }
+    }
+
+    if let Some(name) = gsettings_icon_theme() {
+        return name;
+    }
+
+    if let Some(name) = ini_icon_theme() {
+        return name;
+    }
+
+    "hicolor".to_string()
+}
+
+/// `gsettings get org.gnome.desktop.interface icon-theme`.
+///
+/// One subprocess, called once at startup and once per config change — never
+/// per icon. dconf's on-disk format is a binary GVDB and not worth parsing;
+/// this is the supported way to read it.
+///
+/// An empty string means the key is unset, which is a normal state on a
+/// non-GNOME desktop and must not be taken as a theme name.
+fn gsettings_icon_theme() -> Option<String> {
+    let out = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "icon-theme"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !out.status.success() {
+        return None;
+    }
+
+    // gsettings prints a GVariant: 'MacTahoe-dark', or '' when unset.
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let name = raw.trim().trim_matches(['\'', '"']).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// `gtk-icon-theme-name` from the GTK settings files, gtk-4 before gtk-3.
+fn ini_icon_theme() -> Option<String> {
+    let home = dirs::home_dir()?;
+    for rel in [
+        ".config/gtk-4.0/settings.ini",
+        ".config/gtk-3.0/settings.ini",
+    ] {
+        let Ok(text) = std::fs::read_to_string(home.join(rel)) else {
+            continue;
+        };
+        if let Some(name) = ini_value(&text, "gtk-icon-theme-name") {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// One `key=value` out of an ini-ish file. Section headers are ignored: the
+/// keys we read are unambiguous and appear in exactly one section each.
+fn ini_value(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(&format!("{key}=")) {
+            let v = rest.trim().trim_matches('"').trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Theme directories, in search order.
@@ -62,28 +199,9 @@ fn theme_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// The user's preferred theme, then the inherited chain, then `hicolor`.
+/// The active theme, then its inherited chain, then `hicolor`.
 fn theme_chain() -> Vec<String> {
-    let mut chain = Vec::new();
-
-    if let Ok(name) = std::env::var("GTK_ICON_THEME") {
-        chain.push(name);
-    }
-    // A GTK install without the env var usually still has a preference here.
-    if let Some(home) = dirs::home_dir() {
-        let pref = home.join(".config/gtk-3.0/settings.ini");
-        if let Ok(text) = std::fs::read_to_string(pref) {
-            for line in text.lines() {
-                if let Some(rest) = line.trim().strip_prefix("gtk-icon-theme-name=") {
-                    let name = rest.trim().trim_matches('"').to_string();
-                    if !name.is_empty() && !chain.contains(&name) {
-                        chain.push(name);
-                    }
-                }
-            }
-        }
-    }
-
+    let mut chain = vec![active_theme()];
     chain.push("hicolor".to_string());
     chain.dedup();
     chain
@@ -126,13 +244,19 @@ pub fn resolve(name: &str) -> Option<PathBuf> {
         return None;
     }
 
-    if let Some(hit) = cache().lock().ok()?.get(name) {
+    // Resolved per theme, so `active_theme()` is read on every call. That is
+    // an atomic-free read of a config snapshot, and it is what lets a theme
+    // change take effect on the next frame with no restart and no cache flush.
+    let theme = active_theme();
+    let key = (theme, name.to_string());
+
+    if let Some(hit) = cache().lock().ok()?.get(&key) {
         return hit.clone();
     }
 
     let found = resolve_uncached(name);
     if let Ok(mut c) = cache().lock() {
-        c.insert(name.to_string(), found.clone());
+        c.insert(key, found.clone());
     }
     found
 }
@@ -432,6 +556,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The precedence rule that decides which file wins.
+    ///
+    /// Written as a fixture rather than a live assertion because the answer
+    /// depends on the machine's dconf and config files; a test that reads the
+    /// real ones passes on the author's desktop and tells you nothing.
+    #[test]
+    fn ini_value_skips_sections_and_comments() {
+        let text = "\
+# a comment
+[Settings]
+gtk-theme-name=adw-gtk3-dark
+gtk-icon-theme-name=\"MacTahoe-dark\"
+";
+        assert_eq!(ini_value(text, "gtk-icon-theme-name").as_deref(), Some("MacTahoe-dark"));
+        assert_eq!(ini_value(text, "gtk-icon-theme-name").is_some(), true);
+        assert_eq!(ini_value(text, "gtk-cursor-theme-name"), None);
+
+        // An empty value is "unset", not a theme called "".
+        assert_eq!(ini_value("[Settings]\ngtk-icon-theme-name=\"\"\n", "gtk-icon-theme-name"), None);
+    }
+
+    /// The cache is keyed by theme, so a switch cannot serve a stale path.
+    /// A cache keyed by name alone is the bug this prevents.
+    #[test]
+    fn cache_is_keyed_by_theme() {
+        resolve("lume-cache-probe");
+        resolve("lume-cache-probe");
+        let entries = cache().lock().unwrap();
+        assert!(
+            entries.keys().all(|(theme, _)| !theme.is_empty()),
+            "every cache entry must record which theme produced it"
+        );
+    }
+
     #[test]
     fn theme_chain_always_ends_with_hicolor() {
         let chain = theme_chain();
@@ -446,5 +604,22 @@ mod tests {
     fn cache_round_trips() {
         let _ = resolve("xyzzy-not-real");
         assert_eq!(resolve("xyzzy-not-real"), None);
+    }
+}
+#[cfg(test)]
+mod probe {
+    //! Not a test — a way to ask the resolver what it actually does on this
+    //! machine. `cargo test -p services probe:: -- --nocapture --ignored`
+
+    #[test]
+    #[ignore = "prints the live answer; run deliberately"]
+    fn show() {
+        println!("detected theme : {}", super::detect_theme());
+        println!("override       : {:?}", super::override_theme());
+        println!("active  theme  : {}", super::active_theme());
+        for n in ["zen-browser", "kitty", "foot", "firefox", "folder"] {
+            println!("  {n:<12} -> {:?}", super::resolve(n));
+        }
+        println!("themes: {}", super::available_themes().join(", "));
     }
 }

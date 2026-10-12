@@ -400,8 +400,13 @@ impl Surfaces {
             // Seed the icon regions now, while a real App is in scope.
             // `Entity::read` needs one, so it cannot be done from render().
             if kind == Kind::Background {
+                let desktop = view
+                    .read(cx)
+                    .desktop
+                    .clone()
+                    .expect("background surface has a desktop");
                 *region_slot.lock().expect("region mutex poisoned") =
-                    view.read(cx).desktop.read(cx).input_regions();
+                    desktop.read(cx).input_regions();
             }
 
             view
@@ -463,9 +468,17 @@ impl Surfaces {
 pub struct SurfaceView {
     kind: Kind,
     focus: FocusHandle,
-    bar: Entity<bar::BarView>,
-    desktop: Entity<background::Desktop>,
-    dock: Entity<panel::Dock>,
+    /// Only the surface that shows them builds them.
+    ///
+    /// These used to be built unconditionally, which meant every one of the
+    /// five surfaces constructed a full desktop — an entry list, an icon
+    /// resolve per item, and a directory poll — and then rendered none of it.
+    /// Measured: five copies of the desktop and five poll timers, and it is
+    /// most of why private dirty sat at 68M instead of 39M. A field that only
+    /// one arm reads should not be paid for by the other four.
+    bar: Option<Entity<bar::BarView>>,
+    desktop: Option<Entity<background::Desktop>>,
+    dock: Option<Entity<panel::Dock>>,
     slide: Option<Slide>,
     /// What was last pushed to the compositor for this surface, so render
     /// stays pure in everything but the one place that must not be.
@@ -493,9 +506,10 @@ impl SurfaceView {
         // The background carries the desktop: icons, context menu, picker.
         // The bar carries its own content. Panels are placeholders until
         // stage 5.
-        let bar = cx.new(|cx| bar::BarView::new(cx));
-        let desktop = cx.new(|cx| background::Desktop::new(size, cx));
-        let dock = cx.new(|cx| panel::Dock::new(cx));
+        let bar = (kind == Kind::Bar).then(|| cx.new(|cx| bar::BarView::new(cx)));
+        let desktop =
+            (kind == Kind::Background).then(|| cx.new(|cx| background::Desktop::new(size, cx)));
+        let dock = (kind == Kind::Dock).then(|| cx.new(|cx| panel::Dock::new(cx)));
 
         let view = Self {
             kind,
@@ -525,8 +539,8 @@ impl SurfaceView {
         // Nothing else polls: one loop the dock owns is a cost we can point at,
         // whereas five surfaces each polling would be a tax nobody could
         // account for.
-        if kind == Kind::Dock {
-            let weak = view.dock.downgrade();
+        if let Some(dock) = view.dock.clone() {
+            let weak = dock.downgrade();
             let changed = cx
                 .try_global::<AppState>()
                 .map(|s| s.compositor.changed());
@@ -534,7 +548,7 @@ impl SurfaceView {
                 // Ask once up front. Waiting for the first event would leave the
                 // dock in its constructed state until something happened to
                 // move, which for dodge means wrong until the user notices.
-                view.dock.update(cx, |dock, cx| dock.refresh(cx));
+                dock.update(cx, |dock, cx| dock.refresh(cx));
 
                 cx.spawn(async move |_weak, cx: &mut gpui::AsyncApp| {
                     loop {
@@ -567,8 +581,7 @@ impl Render for SurfaceView {
         // The dock is the one surface whose visibility is not a constant, so
         // it is the one surface that pushes state while rendering. Even here
         // the push is diffed: an unchanged zone and region cost nothing.
-        if self.kind == Kind::Dock {
-            let dock = self.dock.read(_cx);
+        if let Some(dock) = self.dock.as_ref().map(|d| d.read(_cx)) {
             let h = px(f32::from(window.viewport_size().height));
             let w = window.viewport_size().width;
 
@@ -600,9 +613,24 @@ impl Render for SurfaceView {
         // whole screen and put the text "lume-dock" where the icons should be.
         // An arm that swallows kinds silently is how that survived.
         let body: AnyElement = match self.kind {
-            Kind::Bar => self.bar.clone().into_any_element(),
-            Kind::Background => self.desktop.clone().into_any_element(),
-            Kind::Dock => self.dock.clone().into_any_element(),
+            Kind::Bar => self
+                .bar
+                .as_ref()
+                .expect("bar surface has a bar")
+                .clone()
+                .into_any_element(),
+            Kind::Background => self
+                .desktop
+                .as_ref()
+                .expect("background surface has a desktop")
+                .clone()
+                .into_any_element(),
+            Kind::Dock => self
+                .dock
+                .as_ref()
+                .expect("dock surface has a dock")
+                .clone()
+                .into_any_element(),
             Kind::SidebarLeft | Kind::SidebarRight => div()
                 .id(("lume-panel-placeholder", self.kind.map_order() as usize))
                 .size_full()
@@ -619,8 +647,9 @@ impl Render for SurfaceView {
         // so a slide costs no protocol traffic per frame.
         match self.slide.as_mut() {
             Some(slide) => {
-                if self.kind == Kind::Dock {
-                    slide.set_shown(self.dock.read(_cx).shown(), Instant::now());
+                if let Some(dock) = self.dock.as_ref() {
+                    let shown = dock.read(_cx).shown();
+                    slide.set_shown(shown, Instant::now());
                 }
                 let (progress, animating) = slide.sample(Instant::now());
                 let travel = 1.0 - progress;
