@@ -33,6 +33,8 @@ pub enum Command {
     Quit,
     /// Show or hide a sidebar.
     Panel(intent::Side, Option<bool>),
+    /// Open, close or toggle the wallpaper picker.
+    Picker(intent::PickerOp),
     /// No command — the shell was already running.
     Duplicate,
 }
@@ -51,13 +53,23 @@ impl Command {
             Command::FocusWorkspace(id) => format!("workspace {id}"),
             Command::ToggleSpecial => "toggle-special".into(),
             Command::Quit => "quit".into(),
-            Command::Panel(side, None) => format!("panel {}", side.as_str()),
+            Command::Picker(op) => format!("wallpaper {}", match op {
+            intent::PickerOp::Open => "on",
+            intent::PickerOp::Close => "off",
+            intent::PickerOp::Toggle => "toggle",
+        }),
+        Command::Panel(side, None) => format!("panel {}", side.as_str()),
             Command::Panel(side, Some(open)) => format!(
                 "panel {} {}",
                 side.as_str(),
                 if *open { "on" } else { "off" }
             ),
             // Never sent. `Duplicate` is a result of decoding, not a request.
+            Command::Picker(op) => match op {
+                intent::PickerOp::Open => "wallpaper on".into(),
+                intent::PickerOp::Close => "wallpaper off".into(),
+                intent::PickerOp::Toggle => "wallpaper toggle".into(),
+            },
             Command::Duplicate => "duplicate".into(),
         }
     }
@@ -80,6 +92,18 @@ pub fn decode(line: &str) -> anyhow::Result<Command> {
             Command::FocusWorkspace(id)
         }
         "toggle-special" => Command::ToggleSpecial,
+        "wallpaper" => {
+            // `arg`, not `parts.next()`: the second token was already
+            // consumed above, so reading from the iterator again always
+            // yielded None and every wallpaper command decoded as Toggle.
+            // The round-trip test is what caught it.
+            let op = match arg {
+                None => intent::PickerOp::Toggle,
+                Some(word) => intent::PickerOp::parse(word)
+                    .context("usage: lume wallpaper [on|off|toggle]")?,
+            };
+            Command::Picker(op)
+        }
         "panel" => {
             let side = intent::Side::parse(arg.context("usage: lume panel <left|right> [on|off]")?)
                 .context("usage: lume panel <left|right> [on|off]")?;
@@ -223,6 +247,16 @@ pub fn handle(
             // `false` means the UI thread is gone, which only happens during
             // shutdown. Saying so beats a silent success.
             if tx.send(intent) {
+                "ok".to_string()
+            } else {
+                "error: shell is shutting down".into()
+            }
+        }
+        Command::Picker(op) => {
+            let Some(tx) = intents else {
+                return "error: no shell attached".into();
+            };
+            if tx.send(intent::Intent::Picker(op)) {
                 "ok".to_string()
             } else {
                 "error: shell is shutting down".into()

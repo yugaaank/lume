@@ -33,6 +33,12 @@ tokio = { version = "1", features = ["full"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 rust-embed = "8"
 
+# Used only to make wallpaper thumbnails. `gpui::img(path)` decodes at source
+# resolution with no downscale, so 29 wallpapers at 4K would be ~957 MB of
+# RGBA8. Same version gpui already resolves, so it is not a second copy in the
+# build graph.
+image = "0.25"
+
 [profile.release]
 opt-level = 2
 lto = "thin"

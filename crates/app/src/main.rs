@@ -71,6 +71,9 @@ fn run_shell() -> anyhow::Result<()> {
     // all rather than a global registry of window handles.
     let (sender, mut receiver) = services::intent::channel();
     let shared = std::sync::Arc::new(sender.clone());
+    // So a click handler anywhere can raise an intent without a handle to
+    // main. Same shape as config::current.
+    services::intent::install(sender);
 
     let app = gpui_platform::application();
 
@@ -136,6 +139,9 @@ mod tests {
             Command::Panel(services::intent::Side::Right, None),
             Command::Panel(services::intent::Side::Left, Some(true)),
             Command::Panel(services::intent::Side::Right, Some(false)),
+            Command::Picker(services::intent::PickerOp::Toggle),
+            Command::Picker(services::intent::PickerOp::Open),
+            Command::Picker(services::intent::PickerOp::Close),
         ] {
             let wire = cmd.wire();
             assert_eq!(

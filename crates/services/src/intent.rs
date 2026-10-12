@@ -34,7 +34,7 @@
 //! matters. Dropping the oldest is safe for exactly that reason and would not
 //! be for a queue of side-effecting commands.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::mpsc;
 
@@ -51,8 +51,29 @@ pub enum Intent {
     /// Show or hide a sidebar. Persisted to the config.
     TogglePanel(Side),
     SetPanel { side: Side, open: bool },
+    /// Open, close or toggle the wallpaper picker.
+    Picker(PickerOp),
     /// Quit the shell.
     Quit,
+}
+
+/// What to do about the wallpaper picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerOp {
+    Open,
+    Close,
+    Toggle,
+}
+
+impl PickerOp {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "on" | "open" => Some(PickerOp::Open),
+            "off" | "close" => Some(PickerOp::Close),
+            "toggle" => Some(PickerOp::Toggle),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +122,30 @@ pub fn channel() -> (IntentSender, mpsc::Receiver<Intent>) {
 /// Shared, so the IPC thread and any future producer can publish without
 /// threading a sender through every call site.
 pub type Shared = Arc<IntentSender>;
+
+static INSTALLED: OnceLock<IntentSender> = OnceLock::new();
+
+/// Publish the process-wide sender.
+///
+/// A view holding a click handler needs to raise an intent without a handle
+/// to `main`. This is the same shape as `config::current`: one copy, written
+/// once at startup, read from wherever.
+///
+/// Deliberately sender-only. A global holding the *receiver* would let a
+/// render path consume intents, and intents are the shell's control channel.
+pub fn install(sender: IntentSender) {
+    let _ = INSTALLED.set(sender);
+}
+
+/// Fire an intent from anywhere.
+///
+/// Returns false when the shell has no UI thread left, which only happens
+/// during shutdown.
+pub fn send(intent: Intent) -> bool {
+    INSTALLED
+        .get()
+        .is_some_and(|tx| tx.send(intent))
+}
 
 #[cfg(test)]
 mod tests {

@@ -17,3 +17,4 @@ tracing-subscriber.workspace = true
 dirs.workspace = true
 services = { path = "../services" }
 tokio.workspace = true
+image.workspace = true

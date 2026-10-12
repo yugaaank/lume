@@ -20,6 +20,7 @@ use gpui::{
     prelude::*, px, rgb,
 };
 use gpui::SharedString;
+use std::path::{Path, PathBuf};
 
 use services::{AppState, apps};
 
@@ -33,6 +34,10 @@ pub struct Grid {
     pub padding: f32,
     pub origin: Point<Pixels>,
     pub columns: usize,
+    /// The display this grid was built for. Kept because the picker needs the
+    /// viewport and the grid is what was handed it — deriving it twice from
+    /// two sources is how they end up disagreeing.
+    pub display: Size<Pixels>,
 }
 
 impl Grid {
@@ -43,7 +48,11 @@ impl Grid {
         let origin = point(px(padding), px(64.0));
         let columns =
             (((f32::from(size.width) - padding) / (cell + padding)).floor() as usize).max(1);
-        Self { cell, padding, origin, columns }
+        Self { cell, padding, origin, columns, display: size }
+    }
+
+    pub fn display_size(&self) -> Size<Pixels> {
+        self.display
     }
 
     /// A rect is a pure function of the cell index. That is what makes layout
@@ -236,6 +245,27 @@ impl Entry {
     }
 }
 
+/// What has been handed to the compositor for this surface's input region.
+///
+/// An enum rather than `Option<Option<Vec<Bounds>>>`. "Never pushed" and
+/// "pushed, meaning the whole surface" are genuinely different states, and
+/// the nested Option made that distinction a place to get it wrong — the
+/// first version of this compared the wrong two sides and did not compile.
+#[derive(PartialEq)]
+enum InputRegion {
+    Never,
+    Pushed(Option<Vec<Bounds<Pixels>>>),
+}
+
+impl InputRegion {
+    fn differs(&self, next: Option<&Vec<Bounds<Pixels>>>) -> bool {
+        match self {
+            InputRegion::Never => true,
+            InputRegion::Pushed(pushed) => pushed.as_ref() != next,
+        }
+    }
+}
+
 pub struct Desktop {
     focus: FocusHandle,
     grid: Grid,
@@ -253,8 +283,10 @@ pub struct Desktop {
     /// a file dropped on the Desktop appeared within three seconds and could
     /// not be clicked until lume restarted. `rescan` updated `region` and
     /// nothing carried it to the window.
-    pushed_region: Option<Vec<Bounds<Pixels>>>,
-    picker: Option<Entity<Picker>>,
+    pushed_region: InputRegion,
+    /// The wallpaper the daemon currently has set, if any. Public because the
+    /// overlay highlights it and the overlay is a different surface.
+    pub current_wallpaper: Option<PathBuf>,
     menu_at: Option<Point<Pixels>>,
 }
 
@@ -318,8 +350,8 @@ impl Desktop {
             hovered: None,
             selected: None,
             region,
-            pushed_region: None,
-            picker: None,
+            pushed_region: InputRegion::Never,
+            current_wallpaper: Self::current_wallpaper(cx),
             menu_at: None,
         };
 
@@ -371,6 +403,27 @@ impl Desktop {
         .detach();
 
         out
+    }
+
+    /// What the compositor should let the pointer reach.
+    ///
+    /// `None` is the WHOLE surface — the opposite of what it looks like. The
+    /// menu needs it: it is drawn on this surface, and with an icon-rect region
+    /// it could not be clicked. Its scrim dismisses it, so the surface
+    /// swallowing input while the menu is open is the modal behaviour a
+    /// context menu is supposed to have.
+    ///
+    /// The picker is not here any more — it is on the Overlay surface, above
+    /// windows. It could never have worked on Background: that layer is under
+    /// every window, and the surface has no keyboard.
+    ///
+    /// Otherwise: icon rects only, so a click aimed at a terminal behind the
+    /// desktop reaches the terminal.
+    fn interactive_region(&self) -> Option<Vec<Bounds<Pixels>>> {
+        if self.menu_at.is_some() {
+            return None;
+        }
+        Some(self.region.clone())
     }
 
     /// The rectangles that accept input. Empty means invisible to the pointer.
@@ -454,7 +507,15 @@ impl Desktop {
                 }
                 Err(e) => tracing::error!("could not create folder: {e:#}"),
             },
-            MenuAction::PickWallpaper => self.set_picker(cx),
+            // Goes through the intent channel like every other path, so the
+            // click path and the keybind path are the same code. The picker
+            // lives on the Overlay surface now: on Background it was behind
+            // every window and could not take the keyboard.
+            MenuAction::PickWallpaper => {
+                services::intent::send(services::intent::Intent::Picker(
+                    services::intent::PickerOp::Open,
+                ));
+            }
             MenuAction::OpenTerminal => match self.open_terminal(cx) {
                 Ok(()) => {}
                 Err(e) => tracing::error!("could not open a terminal: {e:#}"),
@@ -486,16 +547,26 @@ impl Desktop {
         Ok(())
     }
 
-    fn set_picker(&mut self, cx: &mut Context<Self>) {
-        if self.picker.is_some() {
-            return;
+    /// The wallpaper currently applied, read back from the daemon.
+    ///
+    /// Shown highlighted in the picker so "which one is mine" is answerable
+    /// without setting one and looking.
+    fn current_wallpaper(cx: &mut Context<Self>) -> Option<PathBuf> {
+        let out = std::process::Command::new("awww")
+            .arg("query")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
         }
-        self.picker = Some(cx.new(|cx| Picker::new(cx)));
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text.lines().find(|l| l.contains("Output:"))?;
+        let path = line.split("Output:").nth(1)?.trim();
+        // The daemon reports an absolute path; the grid holds one too.
+        (!path.is_empty()).then(|| PathBuf::from(path))
     }
 
-    fn close_picker(&mut self) {
-        self.picker = None;
-    }
 }
 
 // ---------------------------------------------------------------- render
@@ -518,12 +589,37 @@ impl Render for Desktop {
         // `Some(&[])` means "no input anywhere" and `None` means "everywhere".
         // An empty list is correct here — a Desktop with no icons should not
         // eat clicks meant for the windows behind it.
-        if self.pushed_region.as_ref() != Some(&self.region) {
-            let rects = self.region.clone();
-            tracing::debug!(rects = rects.len(), "input region pushed");
-            window.set_input_region(Some(&rects));
-            self.pushed_region = Some(rects);
+        let region = self.interactive_region();
+        if self.pushed_region.differs(region.as_ref()) {
+            tracing::debug!(
+                rects = region.as_ref().map(|r| r.len()).unwrap_or(usize::MAX),
+                menu = self.menu_at.is_some(),
+                "input region pushed"
+            );
+            window.set_input_region(region.as_deref());
+            self.pushed_region = InputRegion::Pushed(region);
         }
+
+        // Escape closes the menu. The picker is not handled here — it lives
+        // on the Overlay surface, which is the only one of ours that can
+        // receive a key at all.
+        // `Box::new` around a closure, because a bare closure captured here
+        // and used later fails the higher-ranked lifetime bound on
+        // `on_key_down` in a way that reads as a compiler bug rather than as
+        // what it is.
+        let on_key: Box<dyn Fn(&gpui::KeyDownEvent, &mut Window, &mut gpui::App) + 'static> = {
+            let this = cx.entity();
+            Box::new(move |event: &gpui::KeyDownEvent, _w, cx| {
+                if event.keystroke.key != "escape" {
+                    return;
+                }
+                this.update(cx, |me, cx| {
+                    if me.menu_at.take().is_some() {
+                        cx.notify();
+                    }
+                });
+            })
+        };
 
         let this = cx.entity();
         let this_move = this.clone();
@@ -543,7 +639,19 @@ impl Render for Desktop {
             });
 
         // --- icons -------------------------------------------------------
-        layer = layer.children(self.placed.iter().map(|(id, cell)| {
+        layer = layer
+            .on_key_down(on_key)
+            .on_mouse_down(gpui::MouseButton::Right, {
+                let this = this.clone();
+                move |event: &gpui::MouseDownEvent, _w, cx| {
+                    let at = event.position;
+                    this.update(cx, |me, cx| {
+                        me.menu_at = Some(at);
+                        cx.notify();
+                    });
+                }
+            })
+            .children(self.placed.iter().map(|(id, cell)| {
             let cell = *cell;
             let Some(entry) = self.entry(id).cloned() else {
                 return div().id(("lume-icon-missing", hash_of(id)));
@@ -607,11 +715,6 @@ impl Render for Desktop {
         }
 
 
-        // --- picker -------------------------------------------------------
-        if let Some(picker) = &self.picker {
-            layer = layer.child(picker.clone());
-        }
-
         layer
     }
 }
@@ -625,7 +728,15 @@ fn self_menu(
     // Positioned inside the screen: a click near the bottom-right would
     // otherwise put half the menu off-screen.
     let w = 180.0;
-    let h = 240.0;
+    // Three items at 28px, plus 2x8px padding and three 4px gaps. Hardcoded
+    // to 240 it drew a 240px menu around 100px of content, with the last two
+    // items floating in dead space and the real ones not where the eye
+    // expects.
+    let item_h = 28.0;
+    let gap = 4.0;
+    let pad = 8.0;
+    let count = 3.0;
+    let h = count * item_h + (count - 1.0) * gap + pad * 2.0;
     let size = _window.viewport_size();
     let x = f32::from(at.x).min(f32::from(size.width) - w - 8.0);
     let y = f32::from(at.y).min(f32::from(size.height) - h - 8.0);
@@ -671,6 +782,26 @@ fn self_menu(
         .border_color(gpui::hsla(0.0, 0.0, 1.0, 0.10))
         .rounded(px(10.0))
         .shadow_lg()
+        .child(
+            // The scrim goes in FIRST so the menu paints above it. Ordering
+            // children back-to-front is the whole reason this element is
+            // written as one tree rather than assembled from pieces.
+            div()
+                .id("lume-desktop-menu-scrim")
+                .absolute()
+                .left_0()
+                .top_0()
+                .size_full()
+                .on_click({
+                    let this = this.clone();
+                    move |_, _w, cx| {
+                        this.update(cx, |me, cx| {
+                            me.menu_at = None;
+                            cx.notify();
+                        });
+                    }
+                }),
+        )
         .child(item(
             SharedString::from("New folder"),
             MenuAction::NewFolder,
@@ -694,7 +825,10 @@ fn self_menu(
                 .absolute()
                 .left_0()
                 .top_0()
-                .size(px(1.0))
+                // The whole surface, not a 1x1 placeholder. This is what a
+                // click outside the menu lands on, and with the input region
+                // widened for the overlay it is the only thing that does.
+                .size_full()
                 .on_click({
                     let this = this.clone();
                     move |_, _w, cx| {

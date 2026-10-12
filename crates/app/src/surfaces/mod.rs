@@ -41,8 +41,10 @@ use std::time::{Duration, Instant};
 
 pub mod background;
 pub mod bar;
+pub mod overlay;
 pub mod panel;
 pub mod picker;
+pub mod thumbs;
 
 pub const SIDEBAR_WIDTH: f32 = 220.0;
 pub const DOCK_HEIGHT: f32 = 64.0;
@@ -50,6 +52,19 @@ pub const SLIDE_MS: u64 = 180;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
+    /// Full-screen `Overlay` layer surface.
+    ///
+    /// Separate from Background because a picker on the Background surface is
+    /// behind every window: the wallpaper picker opened, decoded 29
+    /// thumbnails, and was invisible under a single fullscreen window. It also
+    /// cannot receive keys there — the Background surface is
+    /// `KeyboardInteractivity::None` — which is why "Escape to close" could
+    /// never have worked no matter how it was wired.
+    ///
+    /// The Overlay layer is above windows and takes keyboard on demand, which
+    /// is exactly what a modal overlay needs. It also reserves nothing, so an
+    /// idle shell costs one more surface and no compositor work.
+    Overlay,
     Background,
     Bar,
     Dock,
@@ -60,6 +75,7 @@ pub enum Kind {
 impl Kind {
     fn app_id(self) -> &'static str {
         match self {
+            Kind::Overlay => "lume-overlay",
             Kind::Background => "lume-bg",
             Kind::Bar => "lume-bar",
             Kind::Dock => "lume-dock",
@@ -71,11 +87,12 @@ impl Kind {
     /// Horizontal edges first, then vertical. See the module docs.
     fn map_order(self) -> u8 {
         match self {
-            Kind::Background => 0,
-            Kind::Bar => 1,
-            Kind::Dock => 2,
-            Kind::SidebarLeft => 3,
-            Kind::SidebarRight => 4,
+            Kind::Overlay => 0,
+            Kind::Background => 1,
+            Kind::Bar => 2,
+            Kind::Dock => 3,
+            Kind::SidebarLeft => 4,
+            Kind::SidebarRight => 5,
         }
     }
 }
@@ -93,6 +110,19 @@ struct Spec {
 
 fn spec_for(kind: Kind, w: f32, h: f32, dock_mode: panel::DockMode) -> Spec {
     match kind {
+        // Full-screen, reserves nothing, and takes keyboard on demand so a
+        // modal overlay can be dismissed with the keyboard.
+        Kind::Overlay => Spec {
+            restore_zone: 0.0,
+            layer: Layer::Overlay,
+            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+            keyboard: KeyboardInteractivity::OnDemand,
+            width: w,
+            height: h,
+            // Mapped hidden: an overlay with nothing to show must not eat
+            // clicks aimed at the windows underneath it.
+            visible: false,
+        },
         Kind::Background => Spec {
             restore_zone: 0.0,
             layer: Layer::Background,
@@ -223,6 +253,16 @@ impl SurfaceHandle {
     pub fn sidebar(&self, cx: &mut gpui::App) -> Option<Entity<panel::Sidebar>> {
         self.view.read(cx).sidebar.clone()
     }
+
+    /// The desktop this surface shows, if it is one.
+    pub fn desktop(&self, cx: &mut gpui::App) -> Option<Entity<background::Desktop>> {
+        self.view.read(cx).desktop.clone()
+    }
+
+    /// The overlay this surface shows, if it is one.
+    pub fn overlay(&self, cx: &mut gpui::App) -> Option<Entity<overlay::Overlay>> {
+        self.view.read(cx).overlay.clone()
+    }
     pub fn is_visible(&self) -> bool {
         self.visible
     }
@@ -311,22 +351,40 @@ fn report(result: anyhow::Result<()>) {
     }
 }
 
-/// The sidebar views, reachable from an intent handler.
+/// The views an intent can act on.
 ///
 /// Entities, not window handles. An intent arrives from the IPC thread and
-/// lands here; it then goes through the same `set_open` the UI would have
-/// called, so there is still exactly one owner of a sidebar's visibility.
+/// lands here; it then goes through the same setter the UI would have called,
+/// so there is still exactly one owner of each surface's state.
+///
+/// Renamed from `Panels` when the wallpaper picker needed a home here too.
+/// Two globals holding one idea each is worse than one holding both.
 #[derive(Clone)]
-pub struct Panels {
+pub struct Ui {
     pub left: Entity<panel::Sidebar>,
     pub right: Entity<panel::Sidebar>,
+    pub desktop: Entity<background::Desktop>,
+    pub overlay: Entity<overlay::Overlay>,
 }
 
-impl gpui::Global for Panels {}
+impl gpui::Global for Ui {}
 
 /// Apply one intent. The only place outside a view that may change one.
 pub fn apply_intent(cx: &mut gpui::App, intent: intent::Intent) {
     match intent {
+        intent::Intent::Picker(op) => {
+            let Some(ui) = cx.try_global::<Ui>() else {
+                tracing::warn!("picker intent with no ui registered");
+                return;
+            };
+            let overlay = ui.overlay.clone();
+            let current = ui.desktop.read(cx).current_wallpaper.clone();
+            overlay.update(cx, |o, cx| match op {
+                intent::PickerOp::Open => o.open_picker(current, cx),
+                intent::PickerOp::Close => o.close(cx),
+                intent::PickerOp::Toggle => o.toggle_picker(current, cx),
+            });
+        }
         intent::Intent::Quit => {
             tracing::info!("quit requested over IPC");
             cx.quit();
@@ -363,13 +421,13 @@ fn set_panel(cx: &mut gpui::App, side: intent::Side, open: bool) {
     // Cloned out before the update: holding the global borrow across
     // `Entity::update` borrows `cx` twice and will not compile, and the
     // Entity is a cheap handle.
-    let entity = match cx.try_global::<Panels>() {
-        Some(panels) => Some(match side {
-            intent::Side::Left => panels.left.clone(),
-            intent::Side::Right => panels.right.clone(),
+    let entity = match cx.try_global::<Ui>() {
+        Some(ui) => Some(match side {
+            intent::Side::Left => ui.left.clone(),
+            intent::Side::Right => ui.right.clone(),
         }),
         None => {
-            tracing::warn!(side = side.as_str(), "panel intent with no panels registered");
+            tracing::warn!(side = side.as_str(), "panel intent with no ui registered");
             None
         }
     };
@@ -384,6 +442,7 @@ fn set_panel(cx: &mut gpui::App, side: intent::Side, open: bool) {
 /// Open it once, at startup. Adding a surface later means restarting, which
 /// is deliberate: map order is fixed at map time and re-mapping breaks it.
 pub struct Surfaces {
+    pub overlay: SurfaceHandle,
     pub background: SurfaceHandle,
     pub bar: SurfaceHandle,
     pub dock: SurfaceHandle,
@@ -453,6 +512,7 @@ impl Surfaces {
             .map(|s| s.config.get().dock.mode)
             .unwrap_or_default();
         let opened: Vec<SurfaceHandle> = [
+            Kind::Overlay,
             Kind::Background,
             Kind::Bar,
             Kind::Dock,
@@ -463,8 +523,14 @@ impl Surfaces {
         .map(|kind| Self::open_one(cx, kind, w, h, dock_mode))
         .collect();
 
-        if let (Some(left), Some(right)) = (opened[3].sidebar(cx), opened[4].sidebar(cx)) {
-            cx.set_global(Panels { left, right });
+        let overlay = opened[0].overlay(cx);
+        if let (Some(left), Some(right), Some(desktop), Some(overlay)) = (
+            opened[4].sidebar(cx),
+            opened[5].sidebar(cx),
+            opened[1].desktop(cx),
+            overlay,
+        ) {
+            cx.set_global(Ui { left, right, desktop, overlay });
         }
 
         tracing::info!(
@@ -475,6 +541,7 @@ impl Surfaces {
 
         let mut it = opened.into_iter();
         Surfaces {
+            overlay: it.next().expect("overlay"),
             background: it.next().expect("background"),
             bar: it.next().expect("bar"),
             dock: it.next().expect("dock"),
@@ -576,6 +643,7 @@ impl Surfaces {
 
     pub fn handle_mut(&mut self, kind: Kind) -> Option<&mut SurfaceHandle> {
         match kind {
+            Kind::Overlay => Some(&mut self.overlay),
             Kind::Background => Some(&mut self.background),
             Kind::Bar => Some(&mut self.bar),
             Kind::Dock => Some(&mut self.dock),
@@ -598,6 +666,7 @@ pub struct SurfaceView {
     /// most of why private dirty sat at 68M instead of 39M. A field that only
     /// one arm reads should not be paid for by the other four.
     bar: Option<Entity<bar::BarView>>,
+    overlay: Option<Entity<overlay::Overlay>>,
     desktop: Option<Entity<background::Desktop>>,
     dock: Option<Entity<panel::Dock>>,
     /// Exactly one of these, for the two sidebar surfaces.
@@ -630,6 +699,8 @@ impl SurfaceView {
         // The bar carries its own content. Panels are placeholders until
         // stage 5.
         let bar = (kind == Kind::Bar).then(|| cx.new(|cx| bar::BarView::new(cx)));
+        let overlay = (kind == Kind::Overlay)
+            .then(|| cx.new(|cx| overlay::Overlay::new(size, cx)));
         let desktop =
             (kind == Kind::Background).then(|| cx.new(|cx| background::Desktop::new(size, cx)));
         let dock = (kind == Kind::Dock).then(|| cx.new(|cx| panel::Dock::new(cx)));
@@ -643,6 +714,7 @@ impl SurfaceView {
             kind,
             focus: cx.focus_handle(),
             bar,
+            overlay,
             desktop,
             dock,
             sidebar,
@@ -710,6 +782,22 @@ impl Render for SurfaceView {
         // The dock is the one surface whose visibility is not a constant, so
         // it is the one surface that pushes state while rendering. Even here
         // the push is diffed: an unchanged zone and region cost nothing.
+        if let Some(overlay) = self.overlay.as_ref().map(|o| o.read(_cx)) {
+            // Mapped, but empty: no input anywhere. Shown: the whole surface,
+            // because a modal overlay is supposed to take the pointer.
+            let open = !overlay.is_empty();
+            let want = Pushed {
+                zone: px(0.0),
+                region: (!open).then_some(Vec::new()).filter(|_| !open),
+            };
+            if self.pushed.as_ref() != Some(&want) {
+                tracing::debug!(open, "overlay push");
+                window.set_exclusive_zone(want.zone);
+                window.set_input_region(if open { None } else { Some(&[]) });
+                self.pushed = Some(want);
+            }
+        }
+
         if let Some(sidebar) = self.sidebar.as_ref().map(|s| s.read(_cx)) {
             let viewport = window.viewport_size();
             let h = px(f32::from(viewport.height));
@@ -766,6 +854,12 @@ impl Render for SurfaceView {
         // whole screen and put the text "lume-dock" where the icons should be.
         // An arm that swallows kinds silently is how that survived.
         let body: AnyElement = match self.kind {
+            Kind::Overlay => self
+                .overlay
+                .as_ref()
+                .expect("overlay surface has an overlay")
+                .clone()
+                .into_any_element(),
             Kind::Bar => self
                 .bar
                 .as_ref()
