@@ -102,6 +102,7 @@ fn run_shell() -> anyhow::Result<()> {
                 // which happens when the IPC thread exits. Nothing else ends
                 // this loop.
                 while let Some(intent) = receiver.recv().await {
+                    tracing::info!(?intent, "intent received");
                     cx.update(|cx| surfaces::apply_intent(cx, intent));
                 }
             })

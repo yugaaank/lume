@@ -136,9 +136,25 @@ impl Render for Overlay {
         div()
             .id("lume-overlay")
             .size_full()
+            // Registers this element as the NODE for `self.focus` in the
+            // rendered frame.
+            //
+            // Without it, `Window::dispatch_key_event` calls
+            // `focus_node_id_in_rendered_frame(self.focus)` and gets nothing
+            // back, because a FocusHandle is not an element until something
+            // calls `track_focus` on it. The consequences looked like "Escape
+            // does not work": focus was set, the surface had exclusive
+            // keyboard, Hyprland delivered the key, and GPUI discarded it
+            // looking for a node that was never registered.
+            .track_focus(&self.focus)
             .on_key_down({
                 let this = cx.entity();
                 move |event: &gpui::KeyDownEvent, _w, cx| {
+                    // Logged for EVERY key, not just escape. The question
+                    // being answered is "does this surface receive keys at
+                    // all", and a handler that silently ignores everything
+                    // else cannot answer it.
+                    tracing::debug!(key = %event.keystroke.key, "overlay key");
                     if event.keystroke.key != "escape" {
                         return;
                     }

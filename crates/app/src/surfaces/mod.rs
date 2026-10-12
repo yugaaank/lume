@@ -116,7 +116,11 @@ fn spec_for(kind: Kind, w: f32, h: f32, dock_mode: panel::DockMode) -> Spec {
             restore_zone: 0.0,
             layer: Layer::Overlay,
             anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            keyboard: KeyboardInteractivity::OnDemand,
+            // Starts at None and is raised to Exclusive only while something
+            // is actually showing. Mapping it OnDemand would be wrong: a
+            // hidden overlay holding exclusive keyboard steals it from every
+            // application on the desktop.
+            keyboard: KeyboardInteractivity::None,
             width: w,
             height: h,
             // Mapped hidden: an overlay with nothing to show must not eat
@@ -794,6 +798,21 @@ impl Render for SurfaceView {
                 tracing::debug!(open, "overlay push");
                 window.set_exclusive_zone(want.zone);
                 window.set_input_region(if open { None } else { Some(&[]) });
+
+                // A modal overlay needs EXCLUSIVE keyboard, not OnDemand.
+                //
+                // OnDemand means "the compositor may give this surface keys
+                // when no regular window has focus". The picker is opened on
+                // top of a running browser, so it never got keys and Escape
+                // did nothing — measured, not inferred: the Close button
+                // worked, which proved input was fine and the fault was
+                // keyboard delivery specifically.
+                window.set_keyboard_interactivity(if open {
+                    gpui::layer_shell::KeyboardInteractivity::Exclusive
+                } else {
+                    gpui::layer_shell::KeyboardInteractivity::None
+                });
+
                 self.pushed = Some(want);
             }
         }
