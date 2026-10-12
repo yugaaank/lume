@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 pub mod background;
 pub mod bar;
+pub mod launcher;
 pub mod menu;
 pub mod overlay;
 pub mod panel;
@@ -406,6 +407,19 @@ pub fn apply_intent(cx: &mut gpui::App, intent: intent::Intent) {
                     let _ = o.close(cx);
                 }
                 intent::PickerOp::Toggle => o.toggle_picker(current, cx),
+            });
+        }
+        intent::Intent::Launcher(op) => {
+            let Some(ui) = cx.try_global::<Ui>() else {
+                tracing::warn!("launcher intent with no ui registered");
+                return;
+            };
+            let overlay = ui.overlay.clone();
+            overlay.update(cx, |o, cx| match op {
+                intent::LauncherOp::Open => o.open_launcher(cx),
+                intent::LauncherOp::Close => {
+                    let _ = o.close(cx);
+                }
             });
         }
         intent::Intent::Quit => {
@@ -986,4 +1000,49 @@ impl Render for SurfaceView {
             None => body.into_any_element(),
         }
     }
+}
+
+/// An application icon, or a letter tile when the theme has nothing for that
+/// name.
+///
+/// `fallback_label` is the *display* name, not the icon name. An unresolved
+/// icon is common and says nothing about the app: wine writes `Icon=` keys
+/// like `0CC0_hollow_knight.0` that point into the wine prefix and will never
+/// resolve in any icon theme. Taking the initial of the icon name renders a
+/// literal "0" on the desktop, which tells the user nothing and looks broken.
+/// The label's initial at least says which app it is.
+///
+/// One function rather than one per surface: the bar, the dock, the desktop and
+/// the launcher all draw the same icon, and four copies is four places for the
+/// `PathBuf`-not-`String` trap below to be re-broken.
+pub fn app_icon(name: &str, fallback_label: &str, size: gpui::Pixels) -> gpui::AnyElement {
+    let name = name.trim();
+
+    // Resolve against the user's icon theme the way a GTK client does: search
+    // $XDG_DATA_DIRS/icons/<theme>, follow Inherits, fall back to hicolor.
+    if let Some(path) = services::icons::resolve(name) {
+        // PathBuf, not String: a string path becomes `Resource::Embedded`, an
+        // asset id looked up through the AssetSource, which silently does not
+        // exist and renders as a blank rectangle.
+        return gpui::img(path).size(size).into_any_element();
+    }
+
+    let initial = fallback_label
+        .trim()
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .unwrap_or('?')
+        .to_uppercase()
+        .collect::<String>();
+
+    div()
+        .size(size)
+        .rounded(px(8.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::hsla(0.60, 0.20, 0.45, 0.5))
+        .text_color(rgb(0xf0f0f0))
+        .child(initial)
+        .into_any_element()
 }

@@ -66,8 +66,32 @@ pub enum Intent {
         /// and comparing floats for equality is a trap.
         anchor_x: Option<f32>,
     },
+    /// Open or close the launcher.
+    ///
+    /// Not a `Toggle`: the launcher is modal and owns the keyboard while it is
+    /// up, so a keybind that fired a toggle could be re-entered by a repeat
+    /// and close it again. Explicit verbs cannot do that.
+    Launcher(LauncherOp),
     /// Quit the shell.
     Quit,
+}
+
+/// What to do about the launcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherOp {
+    Open,
+    Close,
+}
+
+impl LauncherOp {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "on" | "open" => Some(LauncherOp::Open),
+            "off" | "close" => Some(LauncherOp::Close),
+            // "toggle" is deliberately absent. See the variant's comment.
+            _ => None,
+        }
+    }
 }
 
 /// What to do about the wallpaper picker.

@@ -335,15 +335,21 @@ impl BarView {
     /// Render one widget. `Option` because a widget can be unavailable on this
     /// machine right now.
     fn render_widget(&self, widget: &widgets::Widget) -> Vec<gpui::AnyElement> {
-        // Clickable when there is a drawer for it. A widget with no drawer is
+        // Clickable when it leads somewhere. A widget with nothing behind it is
         // not clickable and does not pretend to be — the cursor is the tell,
         // and a pointer cursor over something that does nothing is a lie the
         // user has to discover by clicking.
-        let menu = match widget {
-            widgets::Widget::Volume => Some(super::menu::MenuId::Volume),
-            widgets::Widget::Network => Some(super::menu::MenuId::Network),
-            widgets::Widget::Battery => Some(super::menu::MenuId::Battery),
-            widgets::Widget::Clock => Some(super::menu::MenuId::Clock),
+        //
+        // The clock is the exception to "drawer for every clickable widget": it
+        // opens the launcher. It was a placeholder drawer saying "nothing to
+        // configure yet", which is worse than no drawer — a time display is
+        // what people click to start doing things, and REQUIREMENTS.md says so
+        // explicitly.
+        let click = match widget {
+            widgets::Widget::Volume => Some(Click::Drawer(super::menu::MenuId::Volume)),
+            widgets::Widget::Network => Some(Click::Drawer(super::menu::MenuId::Network)),
+            widgets::Widget::Battery => Some(Click::Drawer(super::menu::MenuId::Battery)),
+            widgets::Widget::Clock => Some(Click::Launcher),
             _ => None,
         };
 
@@ -358,9 +364,9 @@ impl BarView {
                 .text_color(rgb(0xe0e0e0))
                 .child(content);
 
-            match menu {
+            match click {
                 None => base.into_any_element(),
-                Some(m) => base
+                Some(a) => base
                     .cursor_pointer()
                     .hover(|h| h.bg(gpui::hsla(0.0, 0.0, 1.0, 0.10)))
                     .on_click(move |_, w, _cx| {
@@ -368,11 +374,8 @@ impl BarView {
                         // widget is this", and the popup is anchored to it.
                         // Without it the keybind path falls back to the right
                         // edge, which is what a keybind wants anyway.
-                        let anchor = w.mouse_position();
-                        services::intent::send(services::intent::Intent::Drawer {
-                            widget: Some(m.name().to_string()),
-                            anchor_x: Some(f32::from(anchor.x)),
-                        });
+                        let anchor_x = f32::from(w.mouse_position().x);
+                        a.send(anchor_x);
                     })
                     .into_any_element(),
             }
@@ -432,6 +435,34 @@ impl BarView {
         };
 
         vec![out]
+    }
+}
+
+/// What a bar widget does when clicked.
+#[derive(Clone, Copy)]
+enum Click {
+    /// Open a widget menu, anchored at the click.
+    Drawer(super::menu::MenuId),
+    /// Open the launcher. The anchor is discarded: the launcher is centred and
+    /// has no cell to point at.
+    Launcher,
+}
+
+impl Click {
+    fn send(self, anchor_x: f32) {
+        match self {
+            Click::Drawer(m) => {
+                services::intent::send(services::intent::Intent::Drawer {
+                    widget: Some(m.name().to_string()),
+                    anchor_x: Some(anchor_x),
+                });
+            }
+            Click::Launcher => {
+                services::intent::send(services::intent::Intent::Launcher(
+                    services::intent::LauncherOp::Open,
+                ));
+            }
+        }
     }
 }
 

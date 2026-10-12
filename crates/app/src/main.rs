@@ -146,6 +146,8 @@ mod tests {
             Command::Drawer(Some("volume".into())),
             Command::Drawer(Some("network".into())),
             Command::Drawer(None),
+            Command::Launcher(services::intent::LauncherOp::Open),
+            Command::Launcher(services::intent::LauncherOp::Close),
         ] {
             let wire = cmd.wire();
             assert_eq!(

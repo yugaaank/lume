@@ -39,6 +39,7 @@ use gpui::{
     prelude::*, px, rgb,
 };
 
+use super::launcher::Launcher;
 use super::menu::{self, Menu, MenuId};
 use super::picker::Picker;
 
@@ -50,6 +51,9 @@ pub struct Overlay {
     /// At most one: a second would mean two things competing for the
     /// keyboard on one surface.
     menu: Option<(MenuId, Menu, Option<gpui::Pixels>)>,
+    /// The launcher. At most one, for the same reason as the menu: only one
+    /// thing on this surface may own the keyboard.
+    launcher: Option<Entity<Launcher>>,
     /// The display this overlay covers. The picker needs it to size its grid,
     /// and the surface is the thing that knows.
     display: gpui::Size<gpui::Pixels>,
@@ -65,13 +69,46 @@ impl Overlay {
             focus: cx.focus_handle(),
             picker: None,
             menu: None,
+            launcher: None,
             display,
             focused: false,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.picker.is_none() && self.menu.is_none()
+        self.picker.is_none() && self.menu.is_none() && self.launcher.is_none()
+    }
+
+    /// Open the launcher, replacing whatever is up.
+    ///
+    /// The launcher is the one overlay that can displace another: a user who
+    /// has the picker open and hits the launch keybind meant the launcher.
+    /// Refusing to open, or stacking two panels, are both worse.
+    pub fn open_launcher(&mut self, cx: &mut Context<Self>) {
+        let apps = cx.global::<services::AppState>().apps.clone();
+        let launcher = cx.new(|cx| Launcher::new(apps, cx));
+
+        // Wired here rather than inside the launcher for the same reason the
+        // picker's close handler is: the parent entity handle does not exist
+        // until after `cx.new` returns.
+        let me = cx.entity();
+        launcher.update(cx, |l, _cx| {
+            l.set_on_close(Arc::new(move |app| {
+                me.update(app, |o, cx| {
+                    let _ = o.close(cx);
+                });
+            }));
+            l.set_on_launch(Arc::new(|entry| {
+                super::background::launch_public(entry);
+            }));
+        });
+
+        self.picker = None;
+        self.menu = None;
+        self.launcher = Some(launcher);
+        self.focused = false;
+        cx.notify();
+        tracing::info!("overlay opened the launcher");
     }
 
     /// Open a widget menu, anchored under the widget that asked for it.
@@ -134,8 +171,12 @@ impl Overlay {
     pub fn close(&mut self, cx: &mut Context<Self>) -> bool {
         let had_picker = self.picker.take().is_some();
         let had_menu = self.menu.take().is_some();
+        // Cleared without recursing through the launcher's own close handler:
+        // that handler calls back into `close`, and following it would mean
+        // this function runs twice for one Escape.
+        let had_launcher = self.launcher.take().is_some();
 
-        if had_picker || had_menu {
+        if had_picker || had_menu || had_launcher {
             self.focused = false;
             // Freed here rather than left to the process lifetime: the
             // thumbnails are ~100 MB of device memory and nothing else wants
@@ -143,7 +184,12 @@ impl Overlay {
             if had_picker {
                 super::thumbs::clear();
             }
-            tracing::info!(picker = had_picker, menu = had_menu, "overlay closed");
+            tracing::info!(
+                picker = had_picker,
+                menu = had_menu,
+                launcher = had_launcher,
+                "overlay closed"
+            );
             cx.notify();
         }
 
@@ -170,21 +216,28 @@ impl Render for Overlay {
         // Take the keyboard once per open. On a surface with
         // `KeyboardInteractivity::OnDemand` this is the whole reason Escape
         // can work; on the Background surface's `None` it could not.
-        if (self.picker.is_some() || self.menu.is_some()) && !self.focused {
+        if self.is_empty() {
+            return div().id("lume-overlay-empty").size_0().into_any_element();
+        }
+
+        if !self.focused {
             window.focus(&self.focus, cx);
             self.focused = true;
         }
 
-        let content: Option<gpui::AnyElement> = match (&self.picker, &self.menu) {
-            (_, Some((_, menu, anchor))) => Some(render_menu(menu.clone(), *anchor, window, cx)),
-            (Some(p), None) => Some(p.clone().into_any_element()),
+        // The launcher wins over everything else: it was opened last, and it
+        // is the only one that takes the whole screen.
+        let content: Option<gpui::AnyElement> = match (&self.launcher, &self.menu, &self.picker) {
+            (Some(l), _, _) => Some(l.clone().into_any_element()),
+            (None, Some((_, menu, anchor)), _) => Some(render_menu(menu.clone(), *anchor, window, cx)),
+            (None, None, Some(p)) => Some(p.clone().into_any_element()),
             _ => None,
         };
 
+        // Nothing to show. Returning an empty, transparent, zero-size node
+        // rather than a full-screen div: a visible div here would paint over
+        // the desktop even with no children.
         let Some(content) = content else {
-            // Nothing to show. Returning an empty, transparent, zero-size node
-            // rather than a full-screen div: a visible div here would paint
-            // over the desktop even with no children.
             return div().id("lume-overlay-empty").size_0().into_any_element();
         };
 
@@ -204,16 +257,30 @@ impl Render for Overlay {
             .track_focus(&self.focus)
             .on_key_down({
                 let this = cx.entity();
-                move |event: &gpui::KeyDownEvent, _w, cx| {
+                move |event: &gpui::KeyDownEvent, w, cx| {
                     // Logged for EVERY key, not just escape. The question
                     // being answered is "does this surface receive keys at
                     // all", and a handler that silently ignores everything
                     // else cannot answer it.
                     tracing::debug!(key = %event.keystroke.key, "overlay key");
                     if event.keystroke.key != "escape" {
+                        // Everything that is not a dismiss belongs to the
+                        // content. The launcher is a text field and the
+                        // overlay is its keyboard: routing here rather than
+                        // giving the launcher its own focus handle means one
+                        // focus owner on this surface, not two that have to
+                        // agree about who has it.
+                        let Some(launcher) = this.read(cx).launcher.clone() else {
+                            return;
+                        };
+                        launcher.update(cx, |l, cx| {
+                            l.on_key(event, w, cx);
+                        });
                         return;
                     }
-                    this.update(cx, |me, cx| me.close(cx));
+                    this.update(cx, |me, cx| {
+                        me.close(cx);
+                    });
                 }
             })
             .child(content)

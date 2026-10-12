@@ -41,6 +41,8 @@ pub enum Command {
     /// falls back to the right edge — which is also what a keybind wants,
     /// since there is no cell to point at.
     Drawer(Option<String>),
+    /// Open or close the launcher. No argument is a malformed request.
+    Launcher(intent::LauncherOp),
     /// No command — the shell was already running.
     Duplicate,
 }
@@ -63,6 +65,10 @@ impl Command {
             intent::PickerOp::Open => "on",
             intent::PickerOp::Close => "off",
             intent::PickerOp::Toggle => "toggle",
+        }),
+        Command::Launcher(op) => format!("launcher {}", match op {
+            intent::LauncherOp::Open => "on",
+            intent::LauncherOp::Close => "off",
         }),
         Command::Panel(side, None) => format!("panel {}", side.as_str()),
             Command::Panel(side, Some(open)) => format!(
@@ -119,6 +125,14 @@ pub fn decode(line: &str) -> anyhow::Result<Command> {
                     .context("usage: lume wallpaper [on|off|toggle]")?,
             };
             Command::Picker(op)
+        }
+        "launcher" => {
+            // Required, unlike `wallpaper`. There is no sensible default:
+            // "toggle" would be the obvious one and it is the one that can
+            // close the launcher with a key repeat, so the verb is explicit.
+            let op = intent::LauncherOp::parse(arg.context("usage: lume launcher on|off")?)
+                .context("usage: lume launcher on|off")?;
+            Command::Launcher(op)
         }
         "panel" => {
             let side = intent::Side::parse(arg.context("usage: lume panel <left|right> [on|off]")?)
@@ -284,6 +298,16 @@ pub fn handle(
                 return "error: no shell attached".into();
             };
             if tx.send(intent::Intent::Picker(op)) {
+                "ok".to_string()
+            } else {
+                "error: shell is shutting down".into()
+            }
+        }
+        Command::Launcher(op) => {
+            let Some(tx) = intents else {
+                return "error: no shell attached".into();
+            };
+            if tx.send(intent::Intent::Launcher(op)) {
                 "ok".to_string()
             } else {
                 "error: shell is shutting down".into()

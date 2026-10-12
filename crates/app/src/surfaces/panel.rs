@@ -45,39 +45,7 @@ pub struct DockDemand {
 
 /// An icon resolved against the user's theme, with a themed fallback.
 fn icon(name: &str, fallback_label: &str, size: f32) -> AnyElement {
-    let size = px(size);
-
-    if let Some(path) = services::icons::resolve(name) {
-        // A PathBuf, not a String. `impl From<String> for ImageSource` builds
-        // `Resource::Embedded`, which is an asset id looked up through the
-        // AssetSource — a filesystem path passed as a string is silently an
-        // asset that does not exist, and you get a blank rectangle with no
-        // error. `From<PathBuf>` is what yields `Resource::Path`.
-        return gpui::img(path).size(size).into_any_element();
-    }
-
-    // Not found. A neutral tile is better than a broken image. The initial
-    // comes from the display name: an unresolvable Icon= key says nothing
-    // about the app, and wine writes keys like `0CC0_game.0` that no icon
-    // theme will ever have.
-    let initial = fallback_label
-        .trim()
-        .chars()
-        .find(|c| c.is_alphanumeric())
-        .unwrap_or('?')
-        .to_uppercase()
-        .collect::<String>();
-
-    div()
-        .size(size)
-        .rounded(px(8.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(gpui::hsla(0.60, 0.20, 0.45, 0.5))
-        .text_color(rgb(0xf0f0f0))
-        .child(initial)
-        .into_any_element()
+    super::app_icon(name, fallback_label, px(size))
 }
 
 // ---------------------------------------------------------------- dock

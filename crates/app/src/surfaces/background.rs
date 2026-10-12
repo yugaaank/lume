@@ -994,37 +994,7 @@ fn place(
 /// literal "0" on the desktop, which tells the user nothing and looks broken.
 /// The label's initial at least says which app it is.
 fn icon_tile(name: &str, fallback_label: &str, size: Pixels) -> AnyElement {
-    let name = name.trim();
-
-    // Resolve against the user's icon theme the way a GTK client does: search
-    // $XDG_DATA_DIRS/icons/<theme>, follow Inherits, fall back to hicolor.
-    if let Some(path) = services::icons::resolve(name) {
-        // PathBuf, not String: see the note in panel::icon. A string path
-        // becomes an Embedded asset id, which renders as nothing at all.
-        return gpui::img(path).into_any_element();
-    }
-
-    let initial = fallback_label
-        .trim()
-        .chars()
-        .find(|c| c.is_alphanumeric())
-        .unwrap_or('?')
-        .to_uppercase()
-        .collect::<String>();
-
-    tracing::debug!(icon = %name, "icon not in theme; using letter tile");
-
-    div()
-        .size(size)
-        .rounded(px(8.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(gpui::hsla(0.60, 0.25, 0.45, 0.55))
-        .text_size(px(22.0))
-        .text_color(rgb(0xf0f0f0))
-        .child(SharedString::from(initial))
-        .into_any_element()
+    super::app_icon(name, fallback_label, size)
 }
 
 #[cfg(test)]
