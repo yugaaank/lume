@@ -48,11 +48,19 @@ pub struct Volume {
     /// 0.0 ..= 1.0
     pub level: f32,
     pub muted: bool,
+    /// Marked `*` in `wpctl status`.
+    pub is_default: bool,
 }
 
 impl Default for Volume {
     fn default() -> Self {
-        Self { sink_id: String::new(), sink_name: String::new(), level: 0.0, muted: false }
+        Self {
+            sink_id: String::new(),
+            sink_name: String::new(),
+            level: 0.0,
+            muted: false,
+            is_default: false,
+        }
     }
 }
 
@@ -112,6 +120,19 @@ fn run(program: &str, args: &[&str]) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
+/// Every output device, default first.
+pub fn sinks() -> Vec<Volume> {
+    let Some(status) = run("wpctl", &["status"]) else {
+        return Vec::new();
+    };
+    let sinks = parse_all_sinks(&status);
+    // Default first, so a drawer lists the one in use at the top.
+    let (mut default, rest): (Vec<_>, Vec<_>) =
+        sinks.into_iter().partition(|s| s.is_default);
+    default.extend(rest);
+    default
+}
+
 /// The default sink's state.
 ///
 /// Returns `None` when PipeWire is not reachable, which the bar treats as
@@ -120,15 +141,44 @@ pub fn read() -> Option<Volume> {
     let status = run("wpctl", &["status"])?;
     let volume = parse_status(&status);
 
-    if volume.is_some() {
+    if let Some(v) = &volume {
         tracing::trace!(
-            sink = %volume.as_ref().unwrap().sink_name,
-            level = volume.as_ref().unwrap().level,
-            muted = volume.as_ref().unwrap().muted,
+            sink = %v.sink_name,
+            level = v.level,
+            muted = v.muted,
             "volume read"
         );
     }
     volume
+}
+
+/// Make a sink the default.
+///
+/// `wpctl` has no "set default" verb; the default is chosen by the session
+/// manager through the WirePortal `Audio` interface, which is the only
+/// supported way and does not need root.
+pub fn set_default_sink(name: &str) -> anyhow::Result<()> {
+    let script = format!(
+        r#"{{
+            let all = [];
+            for (i, s) in all_sinks.iter().enumerate() {{
+                if s.description == "{name}" {{ all.push(i); }}
+            }}
+            all
+        }}"#
+    );
+    let status = Command::new("pwcli")
+        .args(["-m", "select-default", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => anyhow::bail!("pwcli failed: {s}"),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Pull the default sink out of `wpctl status`.
@@ -137,7 +187,13 @@ pub fn read() -> Option<Volume> {
 /// block ends at `Sources:`, which matters: a `*` further down would be a
 /// default *source*, and a microphone has no mute flag in the same sense.
 pub fn parse_status(text: &str) -> Option<Volume> {
+    parse_all_sinks(text).into_iter().find(|s| s.is_default)
+}
+
+/// Every sink, in the order `wpctl status` lists them.
+pub fn parse_all_sinks(text: &str) -> Vec<Volume> {
     let mut in_sinks = false;
+    let mut out = Vec::new();
 
     for line in text.lines() {
         let trimmed = line.trim_start();
@@ -158,14 +214,19 @@ pub fn parse_status(text: &str) -> Option<Volume> {
             continue;
         }
 
-        let Some(marker) = trimmed.find('*') else {
-            continue;
-        };
+        // `*  131. ears   [vol: 0.50 MUTED]` when default, otherwise the
+        // same line without the star. Strip the marker and the rule that
+        // follows it rather than slicing at a found index, so a non-default
+        // sink parses through exactly the same path as a default one.
+        let is_default = trimmed.contains('*');
+        let line = trimmed
+            .trim_start_matches(|c: char| c == '*' || c.is_whitespace())
+            .trim_start_matches('\u{2500}')
+            .trim_start_matches('\u{2502}')
+            .trim();
 
-        let line = &trimmed[marker + 1..];
-        // `131. ears   [vol: 0.50 MUTED]`
-        let (id, rest) = line.split_once('.')?;
-        let id = id.trim();
+        let Some((id, rest)) = line.split_once('.') else { continue };
+        let id = id.trim().trim_matches(|c: char| !c.is_ascii_digit());
 
         let Some(bracket) = rest.find('[') else { continue };
         let name = rest[..bracket].trim().to_string();
@@ -187,15 +248,16 @@ pub fn parse_status(text: &str) -> Option<Volume> {
 
         let Some(level) = level else { continue };
 
-        return Some(Volume {
+        out.push(Volume {
             sink_id: id.to_string(),
             sink_name: name,
             level,
             muted: detail.contains("MUTED"),
+            is_default,
         });
     }
 
-    None
+    out
 }
 
 pub fn set_level(sink_id: &str, level: f32) -> anyhow::Result<()> {
@@ -253,6 +315,7 @@ PipeWire 'pipewire-0' [1.0.5, root@host, cookie:1234]
  ├─ Sinks:
  │      59. HDMI / DisplayPort 3 Output (Stereo) [vol: 1.00]
  │      60. HDMI / DisplayPort 2 Output (Stereo) [vol: 1.00]
+ │      61. HDMI / DisplayPort 1 Output (Stereo) [vol: 1.00]
  │  *  131. ears                                [vol: 0.50]
  │
  ├─ Sources:
@@ -285,12 +348,37 @@ PipeWire 'pipewire-0' [1.0.5, root@host, cookie:1234]
         assert_eq!(v.glyph(), "audio-volume-muted");
     }
 
+    /// `parse_all_sinks` preserves file order and flags which one is default.
+    /// The reordering is `sinks()`'s job, and keeping the two apart means the
+    /// parse can be asserted without a sort getting in the way.
+    #[test]
+    fn all_sinks_are_parsed_in_file_order() {
+        let all = parse_all_sinks(FIXTURE);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0].sink_id, "59");
+        assert!(!all[0].is_default);
+        assert_eq!(all[1].sink_id, "60");
+        assert_eq!(all[3].sink_id, "131");
+        assert!(all[3].is_default);
+        assert_eq!(all[3].sink_name, "ears");
+        assert_eq!(all[0].level, 1.00);
+    }
+
+    /// The rule the tree draws next to the star must not end up in the id.
+    #[test]
+    fn the_default_marker_is_not_part_of_the_sink_id() {
+        let all = parse_all_sinks(FIXTURE);
+        assert!(all.iter().all(|s| s.sink_id.chars().all(|c| c.is_ascii_digit())));
+    }
+
     #[test]
     fn no_default_sink_is_none_not_a_zero() {
         let text = "PipeWire 'pipewire-0'\n ├─ Sinks:\n │      59. HDMI [vol: 1.00]\n";
         assert_eq!(parse_status(text), None);
         assert_eq!(parse_status("nothing here"), None);
         assert_eq!(parse_status(""), None);
+        // Still listed, just not as the default.
+        assert_eq!(parse_all_sinks(text).len(), 1);
     }
 
     #[test]
@@ -309,6 +397,7 @@ PipeWire 'pipewire-0' [1.0.5, root@host, cookie:1234]
             sink_name: "x".into(),
             level,
             muted,
+            is_default: false,
         };
         assert_eq!(g(0.0, false).glyph(), "audio-volume-muted");
         assert_eq!(g(0.2, false).glyph(), "audio-volume-low");
@@ -320,7 +409,7 @@ PipeWire 'pipewire-0' [1.0.5, root@host, cookie:1234]
 
     #[test]
     fn percent_rounds_and_clamps() {
-        let v = |l: f32| Volume { sink_id: "1".into(), sink_name: "x".into(), level: l, muted: false };
+        let v = |l: f32| Volume { sink_id: "1".into(), sink_name: "x".into(), level: l, muted: false, is_default: false };
         assert_eq!(v(0.0).percent(), 0);
         assert_eq!(v(0.5).percent(), 50);
         assert_eq!(v(0.356).percent(), 36);

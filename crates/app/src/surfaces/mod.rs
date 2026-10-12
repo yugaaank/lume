@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 pub mod background;
 pub mod bar;
+pub mod menu;
 pub mod overlay;
 pub mod panel;
 pub mod picker;
@@ -377,6 +378,21 @@ impl gpui::Global for Ui {}
 /// Apply one intent. The only place outside a view that may change one.
 pub fn apply_intent(cx: &mut gpui::App, intent: intent::Intent) {
     match intent {
+        intent::Intent::Drawer { widget, anchor_x } => {
+            let Some(ui) = cx.try_global::<Ui>() else {
+                tracing::warn!("drawer intent with no ui registered");
+                return;
+            };
+            let overlay = ui.overlay.clone();
+            let anchor_x = anchor_x.map(px);
+            overlay.update(cx, |o, cx| match widget {
+                Some(name) => match menu::MenuId::parse(&name) {
+                    Some(which) => o.open_menu(which, anchor_x, cx),
+                    None => tracing::warn!(%name, "no menu with that name"),
+                },
+                None => o.close_menu(cx),
+            });
+        }
         intent::Intent::Picker(op) => {
             let Some(ui) = cx.try_global::<Ui>() else {
                 tracing::warn!("picker intent with no ui registered");
@@ -386,7 +402,9 @@ pub fn apply_intent(cx: &mut gpui::App, intent: intent::Intent) {
             let current = ui.desktop.read(cx).current_wallpaper.clone();
             overlay.update(cx, |o, cx| match op {
                 intent::PickerOp::Open => o.open_picker(current, cx),
-                intent::PickerOp::Close => o.close(cx),
+                intent::PickerOp::Close => {
+                    let _ = o.close(cx);
+                }
                 intent::PickerOp::Toggle => o.toggle_picker(current, cx),
             });
         }

@@ -143,6 +143,9 @@ mod tests {
             Command::Picker(services::intent::PickerOp::Toggle),
             Command::Picker(services::intent::PickerOp::Open),
             Command::Picker(services::intent::PickerOp::Close),
+            Command::Drawer(Some("volume".into())),
+            Command::Drawer(Some("network".into())),
+            Command::Drawer(None),
         ] {
             let wire = cmd.wire();
             assert_eq!(

@@ -13,6 +13,7 @@ pub mod icons;
 pub mod intent;
 pub mod network;
 pub mod volume;
+pub mod wifi;
 pub mod ipc;
 
 pub use compositor::{Action, CompositorService, Workspace};
@@ -105,5 +106,22 @@ mod live {
         assert!(battery.present, "no battery on this machine");
         assert!(volume.is_some(), "wpctl returned nothing parseable");
         assert!(!ifaces.is_empty(), "no interfaces read");
+    }
+}
+
+#[cfg(test)]
+mod live_sinks {
+    #[test]
+    #[ignore = "runs wpctl"]
+    fn list() {
+        let all = crate::volume::sinks();
+        println!("sinks: {}", all.len());
+        for s in &all {
+            println!(
+                "  {:>4}  {:<52} {:.2}  default={} muted={}",
+                s.sink_id, s.sink_name, s.level, s.is_default, s.muted
+            );
+        }
+        assert!(!all.is_empty());
     }
 }

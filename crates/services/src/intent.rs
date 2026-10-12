@@ -46,13 +46,26 @@ use tokio::sync::mpsc;
 const QUEUE: usize = 64;
 
 /// A request from outside the UI thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
     /// Show or hide a sidebar. Persisted to the config.
     TogglePanel(Side),
     SetPanel { side: Side, open: bool },
     /// Open, close or toggle the wallpaper picker.
     Picker(PickerOp),
+    /// Open the widget menu, or close it.
+    ///
+    /// The anchor is the widget's horizontal centre in screen coordinates, so
+    /// the popup can point at the cell that opened it. Carried in the intent
+    /// rather than re-derived, because the pointer position at click time is
+    /// the most accurate answer available and re-measuring later is not.
+    Drawer {
+        widget: Option<String>,
+        /// Screen x of the widget's centre. , so this variant cannot
+        /// derive Eq - and it should not: a partialEq is all the tests need
+        /// and comparing floats for equality is a trap.
+        anchor_x: Option<f32>,
+    },
     /// Quit the shell.
     Quit,
 }

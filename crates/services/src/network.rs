@@ -210,6 +210,26 @@ pub fn format_rate(bytes_per_sec: f64) -> String {
     }
 }
 
+/// A cumulative byte total, not a rate.
+///
+/// `format_rate` is wrong here: its job is to say "nothing is moving right
+/// now", which for 173 GB moved since boot is a lie. This one never renders
+/// a dash, because a total is never zero on a machine that has been up.
+pub fn format_total(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{:.0}{}", value, UNITS[unit])
+    } else {
+        format!("{:.1}{}", value, UNITS[unit])
+    }
+}
+
 fn read_trim(path: impl AsRef<Path>) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
@@ -336,6 +356,17 @@ mod tests {
     #[test]
     fn a_missing_wireless_table_is_not_an_error() {
         assert!(signal_from(Path::new("/nonexistent/wireless")).is_empty());
+    }
+
+    /// A total must never render as "-", however small it is.
+    #[test]
+    fn totals_never_read_as_nothing() {
+        assert_eq!(format_total(0), "0B");
+        assert_eq!(format_total(1), "1B");
+        assert_eq!(format_total(1024), "1.0K");
+        assert_eq!(format_total(173_000_000_000), "161.1G");
+        // The distinction that matters: 0 bytes total is still a total.
+        assert_ne!(format_total(0), format_rate(0.0));
     }
 
     #[test]

@@ -35,6 +35,12 @@ pub enum Command {
     Panel(intent::Side, Option<bool>),
     /// Open, close or toggle the wallpaper picker.
     Picker(intent::PickerOp),
+    /// Open a widget menu. No argument closes it.
+    ///
+    /// The CLI path has no pointer, so `anchor_x` is `None` and the menu
+    /// falls back to the right edge — which is also what a keybind wants,
+    /// since there is no cell to point at.
+    Drawer(Option<String>),
     /// No command — the shell was already running.
     Duplicate,
 }
@@ -70,6 +76,8 @@ impl Command {
                 intent::PickerOp::Close => "wallpaper off".into(),
                 intent::PickerOp::Toggle => "wallpaper toggle".into(),
             },
+            Command::Drawer(Some(name)) => format!("drawer {name}"),
+            Command::Drawer(None) => "drawer close".into(),
             Command::Duplicate => "duplicate".into(),
         }
     }
@@ -92,6 +100,14 @@ pub fn decode(line: &str) -> anyhow::Result<Command> {
             Command::FocusWorkspace(id)
         }
         "toggle-special" => Command::ToggleSpecial,
+        "drawer" => {
+            let name = match arg {
+                Some(a) if a == "close" => None,
+                Some(a) => Some(a.to_string()),
+                None => None,
+            };
+            Command::Drawer(name)
+        }
         "wallpaper" => {
             // `arg`, not `parts.next()`: the second token was already
             // consumed above, so reading from the iterator again always
@@ -246,6 +262,17 @@ pub fn handle(
             };
             // `false` means the UI thread is gone, which only happens during
             // shutdown. Saying so beats a silent success.
+            if tx.send(intent) {
+                "ok".to_string()
+            } else {
+                "error: shell is shutting down".into()
+            }
+        }
+        Command::Drawer(name) => {
+            let Some(tx) = intents else {
+                return "error: no shell attached".into();
+            };
+            let intent = intent::Intent::Drawer { widget: name, anchor_x: None };
             if tx.send(intent) {
                 "ok".to_string()
             } else {

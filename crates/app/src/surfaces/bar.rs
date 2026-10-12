@@ -314,15 +314,47 @@ impl BarView {
     /// Render one widget. `Option` because a widget can be unavailable on this
     /// machine right now.
     fn render_widget(&self, widget: &widgets::Widget) -> Vec<gpui::AnyElement> {
-        let cell = |content: gpui::AnyElement| {
-            div()
+        // Clickable when there is a drawer for it. A widget with no drawer is
+        // not clickable and does not pretend to be — the cursor is the tell,
+        // and a pointer cursor over something that does nothing is a lie the
+        // user has to discover by clicking.
+        let menu = match widget {
+            widgets::Widget::Volume => Some(super::menu::MenuId::Volume),
+            widgets::Widget::Network => Some(super::menu::MenuId::Network),
+            widgets::Widget::Battery => Some(super::menu::MenuId::Battery),
+            widgets::Widget::Clock => Some(super::menu::MenuId::Clock),
+            _ => None,
+        };
+
+        let cell = move |content: gpui::AnyElement| {
+            let base = div()
                 .id(("lume-bar-cell", hash_name(widget.name())))
                 .flex()
                 .items_center()
                 .gap_1()
+                .px_1()
+                .rounded(px(4.0))
                 .text_color(rgb(0xe0e0e0))
-                .child(content)
-                .into_any_element()
+                .child(content);
+
+            match menu {
+                None => base.into_any_element(),
+                Some(m) => base
+                    .cursor_pointer()
+                    .hover(|h| h.bg(gpui::hsla(0.0, 0.0, 1.0, 0.10)))
+                    .on_click(move |_, w, _cx| {
+                        // The pointer is the most accurate answer to "which
+                        // widget is this", and the popup is anchored to it.
+                        // Without it the keybind path falls back to the right
+                        // edge, which is what a keybind wants anyway.
+                        let anchor = w.mouse_position();
+                        services::intent::send(services::intent::Intent::Drawer {
+                            widget: Some(m.name().to_string()),
+                            anchor_x: Some(f32::from(anchor.x)),
+                        });
+                    })
+                    .into_any_element(),
+            }
         };
 
         // Workspaces first and out of the status match: its content is the
