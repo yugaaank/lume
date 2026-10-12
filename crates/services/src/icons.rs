@@ -185,6 +185,15 @@ fn theme_dirs() -> Vec<PathBuf> {
         dirs.push(h.join(".local/share/icons"));
     }
 
+    // `~/.icons` is in the spec and is still where older installers put things.
+    // It is not under XDG_DATA_HOME, so nothing else finds it.
+    if let Some(h) = dirs::home_dir() {
+        let legacy = h.join(".icons");
+        if legacy.is_dir() && !dirs.contains(&legacy) {
+            dirs.push(legacy);
+        }
+    }
+
     let system: Vec<PathBuf> = std::env::var("XDG_DATA_DIRS")
         .unwrap_or_else(|_| "/usr/local/share:/usr/share".into())
         .split(':')
@@ -291,16 +300,38 @@ fn directories(theme_dir: &Path) -> Vec<String> {
 
 /// How good a candidate is. Bigger is better; we take the max.
 ///
-/// SVG wins outright: we render at 48px, and a scalable source stays sharp
-/// instead of being upscaled from 32px.
-fn score(dir: &str, ext: &str) -> u32 {
+/// Ranked in three bands, not two:
+///
+/// - `scalable` SVG beats everything. We render icons at 48px and a scalable
+///   source stays sharp at any size.
+/// - any other SVG beats any raster, even a 1024px PNG. A vector that has to
+///   be rasterised is still better than a bitmap being upscaled.
+/// - otherwise the pixel size decides.
+///
+/// The two SVG bands are not the same. `places/16/folder.svg` and
+/// `places/scalable/folder.svg` are both vectors, and taking the first one
+/// found renders a 16px icon blown up to 48px — technically vector, visibly
+/// soft, and worse than the raster it beat.
+fn score(dir: &Path, ext: &str) -> u32 {
+    // The size directory is the one above the context: `256x256/apps`.
+    let size_dir = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+
+    let is_scalable = size_dir == "scalable" || dir.file_name().and_then(|n| n.to_str()) == Some("scalable");
+
     if ext == "svg" {
-        return 100_000;
+        return if is_scalable { 300_000 } else { 200_000 };
     }
-    let size = dir
-        .split('x')
-        .next()
-        .and_then(|n| n.parse::<u32>().ok())
+
+    // Parse only the directory NAME. Splitting the whole path on 'x' breaks
+    // on any path containing an x — `/tmp/lume-icon-test-pick/...` scored 0
+    // and silently lost to a 16px icon.
+    let size = size_dir
+        .split_once('x')
+        .and_then(|(a, _)| a.parse::<u32>().ok())
         .unwrap_or(0);
     size.clamp(0, 99_999)
 }
@@ -326,24 +357,9 @@ fn search_theme(theme_root: &Path, name: &str) -> Option<(u32, PathBuf)> {
     }
 
     // The normal layout: `<theme>/<Directories[i]>/<name>.<ext>`.
-    // Directories come from index.theme, but fall back to listing the theme —
-    // a theme missing its index.theme is malformed, and refusing to search it
-    // would show blank icons instead of good ones.
-    let mut dirs = directories(theme_root);
-    if dirs.is_empty() {
-        dirs = std::fs::read_dir(theme_root)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.path().is_dir())
-                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-    }
-
-    for dir in &dirs {
+    for dir in candidate_dirs(theme_root) {
         for ext in PREFERRED {
-            let candidate = theme_root.join(dir).join(format!("{name}.{ext}"));
+            let candidate = dir.join(format!("{name}.{ext}"));
             if !candidate.is_file() {
                 continue;
             }
@@ -354,6 +370,73 @@ fn search_theme(theme_root: &Path, name: &str) -> Option<(u32, PathBuf)> {
         }
     }
     best
+}
+
+/// Every directory inside a theme that could hold an icon.
+///
+/// `index.theme` names these. When it is absent — which is exactly the case
+/// for `~/.local/share/icons/hicolor`, where wine and proton installers drop
+/// their artwork — the theme is walked instead.
+///
+/// The walk goes **two** levels deep, not one, and that is the whole fix.
+/// Listing only the top level finds `hicolor/256x256` and then looks for
+/// `0CC0_hollow_knight.0.png` directly inside it, when the file is actually at
+/// `hicolor/256x256/apps/0CC0_hollow_knight.0.png`. That is why wine game
+/// shortcuts showed a letter tile while their icons sat on disk the whole
+/// time.
+///
+/// Memoised per theme directory: the walk happens on a miss, and a miss is
+/// every unresolved name, so re-walking per lookup would be a filesystem
+/// sweep on the render path.
+fn candidate_dirs(theme_root: &Path) -> &'static [PathBuf] {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, &'static [PathBuf]>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(theme_root).copied()) {
+        return hit;
+    }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    let declared = directories(theme_root);
+    if !declared.is_empty() {
+        dirs.extend(declared.iter().map(|d| theme_root.join(d)));
+    } else {
+        let mut level1 = std::fs::read_dir(theme_root)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for one in &level1 {
+            dirs.push(one.clone());
+            let mut level2 = std::fs::read_dir(one)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            dirs.append(&mut level2);
+        }
+        level1.clear();
+    }
+
+    dirs.retain(|d| d.is_dir());
+    dirs.sort();
+
+    // Leaked deliberately: the list is tiny, lives for the process, and this
+    // is called from render-adjacent code where an Arc would only move the
+    // refcount.
+    let leaked: &'static [PathBuf] = Box::leak(dirs.into_boxed_slice());
+    if let Ok(mut c) = cache.lock() {
+        c.insert(theme_root.to_path_buf(), leaked);
+    }
+    leaked
 }
 
 fn resolve_uncached(name: &str) -> Option<PathBuf> {
@@ -474,6 +557,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The wine/proton case: an icon in a theme that has no `index.theme`,
+    /// two levels down. Listing only the top level misses it entirely, which
+    /// is why game shortcuts on the Desktop showed a letter tile while their
+    /// artwork sat in `~/.local/share/icons/hicolor/256x256/apps/`.
+    #[test]
+    fn finds_icons_in_a_theme_with_no_index_theme() {
+        let base = std::env::temp_dir().join("lume-icon-notheme");
+        let deep = base.join("hicolor/256x256/apps");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("0CC0_game.0.png"), b"x").unwrap();
+        std::fs::create_dir_all(base.join("hicolor/48x48/apps")).unwrap();
+        std::fs::write(base.join("hicolor/48x48/apps/0CC0_game.0.png"), b"x").unwrap();
+
+        // No index.theme anywhere: this is ~/.local/share/icons/hicolor.
+        assert!(directories(&base.join("hicolor")).is_empty());
+
+        assert_eq!(
+            search_theme(&base.join("hicolor"), "0CC0_game.0")
+                .map(|(_, p)| p),
+            Some(deep.join("0CC0_game.0.png")),
+            "the 256x256 copy must beat the 48x48 one"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// One level is not enough, and that is the bug this prevents.
+    #[test]
+    fn candidate_dirs_reaches_two_levels_deep() {
+        let base = std::env::temp_dir().join("lume-icon-depth");
+        std::fs::create_dir_all(base.join("256x256/apps")).unwrap();
+        let dirs = candidate_dirs(&base);
+        assert!(dirs.iter().any(|d| d.ends_with("256x256")), "level 1");
+        assert!(
+            dirs.iter().any(|d| d.ends_with("256x256/apps")),
+            "level 2 - without this, a hicolor-style layout is invisible"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn directories_are_read_from_index_theme() {
         let dir = std::env::temp_dir().join("lume-icon-test-dirs");
@@ -489,9 +612,30 @@ mod tests {
 
     #[test]
     fn scalable_outranks_raster() {
-        assert!(score("scalable/apps", "svg") > score("512x512/apps", "png"));
-        assert!(score("256x256/apps", "png") > score("32x32/apps", "png"));
-        assert_eq!(score("48x48/apps", "png"), 48);
+        let d = |p: &str| PathBuf::from(p);
+        assert!(score(&d("t/scalable/apps"), "svg") > score(&d("t/512x512/apps"), "png"));
+        assert!(score(&d("t/256x256/apps"), "png") > score(&d("t/32x32/apps"), "png"));
+        assert_eq!(score(&d("t/48x48/apps"), "png"), 48);
+    }
+
+    /// A fixed-size SVG is still better than a bigger bitmap, but a scalable
+    /// one is better than both. Collapsing these into one band renders a 16px
+    /// SVG at 48px and calls it vector.
+    #[test]
+    fn scalable_svg_outranks_fixed_svg() {
+        let d = |p: &str| PathBuf::from(p);
+        assert!(score(&d("t/scalable/apps"), "svg") > score(&d("t/512x512/apps"), "svg"));
+        assert!(score(&d("t/512x512/apps"), "svg") > score(&d("t/1024x1024/apps"), "png"));
+    }
+
+    /// The size directory is parsed from its NAME. Splitting the full path on
+    /// 'x' gives 0 for anything under a directory containing an x.
+    #[test]
+    fn score_ignores_x_in_parent_path_components() {
+        let with_x = PathBuf::from("/tmp/lume-icon-test-pick/hicolor/256x256/apps");
+        let without = PathBuf::from("/tmp/hicolor/256x256/apps");
+        assert_eq!(score(&with_x, "png"), score(&without, "png"));
+        assert_eq!(score(&with_x, "png"), 256);
     }
 
     /// The layout assumption that broke icon rendering once: files live in a
@@ -617,7 +761,7 @@ mod probe {
         println!("detected theme : {}", super::detect_theme());
         println!("override       : {:?}", super::override_theme());
         println!("active  theme  : {}", super::active_theme());
-        for n in ["zen-browser", "kitty", "foot", "firefox", "folder"] {
+        for n in ["zen-browser", "folder", "0CC0_hollow_knight.0", "8CE4_re2.0"] {
             println!("  {n:<12} -> {:?}", super::resolve(n));
         }
         println!("themes: {}", super::available_themes().join(", "));
