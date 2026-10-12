@@ -459,7 +459,9 @@ fn icon_tile(name: &str, size: Pixels) -> AnyElement {
     // Resolve against the user's icon theme the way a GTK client does: search
     // $XDG_DATA_DIRS/icons/<theme>, follow Inherits, fall back to hicolor.
     if let Some(path) = services::icons::resolve(name) {
-        return gpui::img(path.to_string_lossy().into_owned()).into_any_element();
+        // PathBuf, not String: see the note in panel::icon. A string path
+        // becomes an Embedded asset id, which renders as nothing at all.
+        return gpui::img(path).into_any_element();
     }
 
     let initial = name

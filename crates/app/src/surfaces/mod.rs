@@ -34,8 +34,10 @@ use gpui::{
     layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
     millis, prelude::*, px,
 };
+use gpui::rgb;
+use services::AppState;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub mod background;
 pub mod bar;
@@ -89,7 +91,7 @@ struct Spec {
     restore_zone: f32,
 }
 
-fn spec_for(kind: Kind, w: f32, h: f32) -> Spec {
+fn spec_for(kind: Kind, w: f32, h: f32, dock_mode: panel::DockMode) -> Spec {
     match kind {
         Kind::Background => Spec {
             restore_zone: 0.0,
@@ -109,6 +111,9 @@ fn spec_for(kind: Kind, w: f32, h: f32) -> Spec {
             height: bar::BAR_HEIGHT,
             visible: true,
         },
+        // Only autohide and dodge start hidden. Always-visible must map with
+        // its zone already set, because the exclusive-zone reservation order
+        // is fixed at map time.
         Kind::Dock => Spec {
             restore_zone: DOCK_HEIGHT,
             layer: Layer::Top,
@@ -116,7 +121,7 @@ fn spec_for(kind: Kind, w: f32, h: f32) -> Spec {
             keyboard: KeyboardInteractivity::OnDemand,
             width: w,
             height: DOCK_HEIGHT,
-            visible: false,
+            visible: dock_mode == panel::DockMode::AlwaysVisible,
         },
         // BOTTOM|LEFT, not TOP|LEFT: the compositor does not subtract the bar's
         // exclusive zone, so a TOP|LEFT sidebar would leave a gap under the
@@ -341,6 +346,10 @@ impl Surfaces {
     }
 
     pub fn open(cx: &mut gpui::App, w: f32, h: f32) -> Self {
+        let dock_mode = cx
+            .try_global::<AppState>()
+            .map(|s| s.config.get().dock.mode)
+            .unwrap_or_default();
         let opened: Vec<SurfaceHandle> = [
             Kind::Background,
             Kind::Bar,
@@ -349,7 +358,7 @@ impl Surfaces {
             Kind::SidebarRight,
         ]
         .into_iter()
-        .map(|kind| Self::open_one(cx, kind, w, h))
+        .map(|kind| Self::open_one(cx, kind, w, h, dock_mode))
         .collect();
 
         tracing::info!(
@@ -368,8 +377,14 @@ impl Surfaces {
         }
     }
 
-    fn open_one(cx: &mut gpui::App, kind: Kind, w: f32, h: f32) -> SurfaceHandle {
-        let s = spec_for(kind, w, h);
+    fn open_one(
+        cx: &mut gpui::App,
+        kind: Kind,
+        w: f32,
+        h: f32,
+        dock_mode: panel::DockMode,
+    ) -> SurfaceHandle {
+        let s = spec_for(kind, w, h, dock_mode);
 
         // Shared with the 'static builder closure, which cannot borrow.
         let initial_region: Arc<std::sync::Mutex<Vec<gpui::Bounds<gpui::Pixels>>>> =
@@ -452,6 +467,25 @@ pub struct SurfaceView {
     desktop: Entity<background::Desktop>,
     dock: Entity<panel::Dock>,
     slide: Option<Slide>,
+    /// What was last pushed to the compositor for this surface, so render
+    /// stays pure in everything but the one place that must not be.
+    pushed: Option<Pushed>,
+    /// A frame-pumping task for the current slide is already running.
+    ///
+    /// Guarded because render runs many times per slide: without it, each of
+    /// those frames would spawn another infinite notifier loop and a 180 ms
+    /// animation would leave dozens running forever.
+    pumping: bool,
+}
+
+/// The compositor-facing state of one surface, diffed against what was last
+/// sent. Comparing rather than sending is what keeps an idle shell at zero
+/// protocol traffic.
+#[derive(PartialEq)]
+struct Pushed {
+    zone: gpui::Pixels,
+    /// `None` means "the whole surface takes input".
+    region: Option<Vec<gpui::Bounds<gpui::Pixels>>>,
 }
 
 impl SurfaceView {
@@ -462,7 +496,8 @@ impl SurfaceView {
         let bar = cx.new(|cx| bar::BarView::new(cx));
         let desktop = cx.new(|cx| background::Desktop::new(size, cx));
         let dock = cx.new(|cx| panel::Dock::new(cx));
-        Self {
+
+        let view = Self {
             kind,
             focus: cx.focus_handle(),
             bar,
@@ -473,7 +508,51 @@ impl SurfaceView {
             } else {
                 Some(Slide::new(visible))
             },
+            pushed: None,
+            pumping: false,
+        };
+
+        // The dock reads the compositor for its dodge mode, and it rides the
+        // event stream rather than polling on a timer.
+        //
+        // Polling looks simpler and costs more: `has_tiled_windows` shells out
+        // to `hyprctl`, and a 200 ms timer is five process spawns a second,
+        // forever, to answer a question the compositor already answers for
+        // free. The stream carries no state — it only says "go look" — and the
+        // sleep afterwards is the floor that covers a dropped event, which is
+        // the same contract the compositor service's own poll uses.
+        //
+        // Nothing else polls: one loop the dock owns is a cost we can point at,
+        // whereas five surfaces each polling would be a tax nobody could
+        // account for.
+        if kind == Kind::Dock {
+            let weak = view.dock.downgrade();
+            let changed = cx
+                .try_global::<AppState>()
+                .map(|s| s.compositor.changed());
+            if let Some(changed) = changed {
+                // Ask once up front. Waiting for the first event would leave the
+                // dock in its constructed state until something happened to
+                // move, which for dodge means wrong until the user notices.
+                view.dock.update(cx, |dock, cx| dock.refresh(cx));
+
+                cx.spawn(async move |_weak, cx: &mut gpui::AsyncApp| {
+                    loop {
+                        // A permit stored by an event that arrived while we
+                        // were sleeping makes this return immediately, so the
+                        // usual case is instant and the sleep is only a floor.
+                        changed.notified().await;
+                        cx.background_executor().timer(panel::DOCK_FLOOR).await;
+                        if weak.update(cx, |dock, cx| dock.refresh(cx)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
         }
+
+        view
     }
 }
 
@@ -484,15 +563,54 @@ impl Focusable for SurfaceView {
 }
 
 impl Render for SurfaceView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // Pure. No mutation, no window calls, no notify, no surface setters.
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // The dock is the one surface whose visibility is not a constant, so
+        // it is the one surface that pushes state while rendering. Even here
+        // the push is diffed: an unchanged zone and region cost nothing.
+        if self.kind == Kind::Dock {
+            let dock = self.dock.read(_cx);
+            let h = px(f32::from(window.viewport_size().height));
+            let w = window.viewport_size().width;
+
+            // Hidden and autohiding still needs a trigger strip: an empty
+            // input region means the surface never sees the pointer, so an
+            // autohiding dock could never be summoned.
+            let region = if dock.shown() {
+                None
+            } else if dock.mode() == panel::DockMode::Autohide && dock.enabled() {
+                Some(vec![gpui::Bounds::new(
+                    gpui::point(px(0.0), h - px(dock.trigger_px())),
+                    gpui::size(w, px(dock.trigger_px())),
+                )])
+            } else {
+                Some(vec![])
+            };
+
+            let want = Pushed { zone: px(dock.zone()), region };
+            if self.pushed.as_ref() != Some(&want) {
+                tracing::debug!(zone = f32::from(want.zone), shown = dock.shown(), "dock push");
+                window.set_exclusive_zone(want.zone);
+                window.set_input_region(want.region.as_deref());
+                self.pushed = Some(want);
+            }
+        }
+
+        // Every surface reaches its own content. The `_` arm used to catch
+        // Background and Dock too, which painted `hsla(0,0,0,0.35)` over the
+        // whole screen and put the text "lume-dock" where the icons should be.
+        // An arm that swallows kinds silently is how that survived.
         let body: AnyElement = match self.kind {
             Kind::Bar => self.bar.clone().into_any_element(),
-            _ => div()
-                .id(("lume-placeholder", self.kind.map_order() as usize))
+            Kind::Background => self.desktop.clone().into_any_element(),
+            Kind::Dock => self.dock.clone().into_any_element(),
+            Kind::SidebarLeft | Kind::SidebarRight => div()
+                .id(("lume-panel-placeholder", self.kind.map_order() as usize))
                 .size_full()
-                .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
-                .child(gpui::SharedString::from(self.kind.app_id()))
+                .bg(gpui::hsla(0.10, 0.05, 0.09, 0.90))
+                .text_color(rgb(0x909090))
+                .text_size(px(11.0))
+                .p_3()
+                .child(gpui::SharedString::from("sidebar - stage 5"))
                 .into_any_element(),
         };
 
@@ -501,7 +619,10 @@ impl Render for SurfaceView {
         // so a slide costs no protocol traffic per frame.
         match self.slide.as_mut() {
             Some(slide) => {
-                let (progress, _) = slide.sample(Instant::now());
+                if self.kind == Kind::Dock {
+                    slide.set_shown(self.dock.read(_cx).shown(), Instant::now());
+                }
+                let (progress, animating) = slide.sample(Instant::now());
                 let travel = 1.0 - progress;
                 let offset = match self.kind {
                     Kind::SidebarLeft => -travel * SIDEBAR_WIDTH,
@@ -509,11 +630,46 @@ impl Render for SurfaceView {
                     Kind::Dock => travel * DOCK_HEIGHT,
                     _ => 0.0,
                 };
-                div()
+                let out = div()
                     .size_full()
                     .relative()
-                    .child(div().absolute().left(px(offset)).top_0().size_full().child(body))
-                    .into_any_element()
+                    .child(div().absolute().left(px(offset)).top_0().size_full().child(body));
+
+                // Keep frames coming only while the slide is actually moving.
+                // An idle shell must not hold a frame loop open — that is the
+                // whole reason `is_active` is reported by `sample()`. The
+                // task ends as soon as the slide settles, and `pumping` stops
+                // it being restarted on every frame in between.
+                if animating && !self.pumping {
+                    self.pumping = true;
+                    _cx.spawn(async move |weak, cx: &mut gpui::AsyncApp| {
+                        loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(SLIDE_MS / 3))
+                                .await;
+                            let done = weak
+                                .update(cx, |this, cx| {
+                                    let (p, animating) = this
+                                        .slide
+                                        .as_mut()
+                                        .map(|s| s.sample(Instant::now()))
+                                        .unwrap_or((1.0, false));
+                                    if animating {
+                                        cx.notify();
+                                    }
+                                    this.pumping = animating;
+                                    !animating
+                                })
+                                .unwrap_or(true);
+                            if done {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
+                }
+
+                out.into_any_element()
             }
             // Both arms must be AnyElement or the match arms disagree.
             None => body.into_any_element(),

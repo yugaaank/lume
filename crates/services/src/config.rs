@@ -28,6 +28,21 @@ pub struct Config {
     pub dock: Dock,
 }
 
+/// When the dock is shown, and whether it reserves space.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DockMode {
+    /// Always on screen, always reserving.
+    #[default]
+    AlwaysVisible,
+    /// Off screen until the pointer reaches the bottom edge. Never reserves.
+    Autohide,
+    /// Reserve and show only when the active workspace has no tiled windows.
+    /// Floating windows are ignored: a desktop with only a floating terminal
+    /// looks empty, and the dock filling that gap is what a user wants.
+    Dodge,
+}
+
 /// Dock contents.
 ///
 /// Pinned desktop-file ids. Running apps appear here too, but only once we
@@ -36,15 +51,21 @@ pub struct Config {
 #[serde(default)]
 pub struct Dock {
     pub pinned: Vec<String>,
-    /// Show the dock at all.
+    /// Show the dock at all. `false` is the third power state: off entirely.
     pub enabled: bool,
-    /// Hide until the pointer reaches the screen edge.
-    pub autohide: bool,
+    pub mode: DockMode,
+    /// Pointer distance from the bottom edge that reveals an autohiding dock.
+    pub trigger_px: f32,
 }
 
 impl Default for Dock {
     fn default() -> Self {
-        Self { pinned: Vec::new(), enabled: true, autohide: false }
+        Self {
+            pinned: Vec::new(),
+            enabled: true,
+            mode: DockMode::default(),
+            trigger_px: 8.0,
+        }
     }
 }
 

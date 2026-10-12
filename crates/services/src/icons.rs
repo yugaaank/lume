@@ -8,8 +8,9 @@
 //!
 //! 1. `$XDG_DATA_HOME/icons` and each `$XDG_DATA_DIRS/icons`
 //! 2. within each theme directory, `$THEME` first, then `hicolor`
-//! 3. `index.theme` names the inherited themes when a theme does not contain
-//!    the icon; we follow those rather than assuming hicolor
+//! 3. `index.theme` names both the inherited themes AND the `Directories=` that
+//!    actually hold the files; we walk those, because `firefox` lives at
+//!    `<theme>/48x48/apps/firefox.png`, not at `<theme>/firefox.png`
 //! 4. extension preference: `svg`, `png`, `xpm`
 //!
 //! ## Why resolve on disk rather than through `AssetSource`
@@ -136,6 +137,101 @@ pub fn resolve(name: &str) -> Option<PathBuf> {
     found
 }
 
+/// Read `Directories=` out of an `index.theme`.
+fn directories(theme_dir: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(theme_dir.join("index.theme")) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    let mut in_header = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_header = line.eq_ignore_ascii_case("[Icon Theme]");
+            continue;
+        }
+        if !in_header {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Directories=") {
+            dirs = rest
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            break;
+        }
+    }
+    dirs
+}
+
+/// How good a candidate is. Bigger is better; we take the max.
+///
+/// SVG wins outright: we render at 48px, and a scalable source stays sharp
+/// instead of being upscaled from 32px.
+fn score(dir: &str, ext: &str) -> u32 {
+    if ext == "svg" {
+        return 100_000;
+    }
+    let size = dir
+        .split('x')
+        .next()
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(0);
+    size.clamp(0, 99_999)
+}
+
+/// Search one theme directory for `name`.
+///
+/// Split out from `resolve_uncached` so it can be tested against a synthetic
+/// tree. Testing through `resolve` would mean mutating `XDG_DATA_DIRS` and
+/// `GTK_ICON_THEME`, which are process-global — that is a race with every
+/// other test in the binary, not a test.
+fn search_theme(theme_root: &Path, name: &str) -> Option<(u32, PathBuf)> {
+    if !theme_root.is_dir() {
+        return None;
+    }
+    let mut best: Option<(u32, PathBuf)> = None;
+
+    // `<theme>/<name>.<ext>` — some themes flatten their layout.
+    for ext in PREFERRED {
+        let flat = theme_root.join(format!("{name}.{ext}"));
+        if flat.is_file() {
+            return Some((100_001, flat));
+        }
+    }
+
+    // The normal layout: `<theme>/<Directories[i]>/<name>.<ext>`.
+    // Directories come from index.theme, but fall back to listing the theme —
+    // a theme missing its index.theme is malformed, and refusing to search it
+    // would show blank icons instead of good ones.
+    let mut dirs = directories(theme_root);
+    if dirs.is_empty() {
+        dirs = std::fs::read_dir(theme_root)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    for dir in &dirs {
+        for ext in PREFERRED {
+            let candidate = theme_root.join(dir).join(format!("{name}.{ext}"));
+            if !candidate.is_file() {
+                continue;
+            }
+            let s = score(dir, ext);
+            if best.as_ref().is_none_or(|(b, _)| s > *b) {
+                best = Some((s, candidate));
+            }
+        }
+    }
+    best
+}
+
 fn resolve_uncached(name: &str) -> Option<PathBuf> {
     // An absolute path is used as-is. `.desktop` files legitimately point at
     // icons outside any theme.
@@ -177,18 +273,27 @@ fn resolve_uncached(name: &str) -> Option<PathBuf> {
         }
     }
 
+    // Walk every inherited theme; first match wins, so a real theme always
+    // beats its parents and hicolor.
+    let mut best: Option<(u32, PathBuf)> = None;
+
     for theme in &expanded {
         for base in theme_dirs() {
-            for ext in PREFERRED {
-                let candidate = base.join(theme).join(format!("{name}.{ext}"));
-                if candidate.is_file() {
-                    return Some(candidate);
+            let found = search_theme(&base.join(theme), name);
+            if found.as_ref().is_some_and(|(s, _)| *s >= 100_000) {
+                // A scalable or flattened hit in the user's own theme beats
+                // any raster fallback. Stop before descending to hicolor.
+                return found.map(|(_, p)| p);
+            }
+            if let Some((s, p)) = found {
+                if best.as_ref().is_none_or(|(b, _)| s > *b) {
+                    best = Some((s, p));
                 }
             }
         }
     }
 
-    None
+    best.map(|(_, p)| p)
 }
 
 /// What themes are actually installed, for the log and for debugging a
@@ -243,6 +348,80 @@ mod tests {
         .unwrap();
         assert_eq!(inherits(&dir), vec!["Adwaita", "hicolor"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directories_are_read_from_index_theme() {
+        let dir = std::env::temp_dir().join("lume-icon-test-dirs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("index.theme"),
+            "[Icon Theme]\nName=Foo\nDirectories=scalable/apps,48x48/apps,16x16/apps\n",
+        )
+        .unwrap();
+        assert_eq!(directories(&dir), vec!["scalable/apps", "48x48/apps", "16x16/apps"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scalable_outranks_raster() {
+        assert!(score("scalable/apps", "svg") > score("512x512/apps", "png"));
+        assert!(score("256x256/apps", "png") > score("32x32/apps", "png"));
+        assert_eq!(score("48x48/apps", "png"), 48);
+    }
+
+    /// The layout assumption that broke icon rendering once: files live in a
+    /// size subdirectory, never directly in the theme root.
+    #[test]
+    fn resolves_through_a_size_subdirectory() {
+        let base = std::env::temp_dir().join("lume-icon-test-tree");
+        let theme = base.join("LumeTestTheme");
+        let dir = theme.join("48x48/apps");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            theme.join("index.theme"),
+            "[Icon Theme]\nName=LumeTestTheme\nDirectories=48x48/apps\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("lume-probe.png"), b"x").unwrap();
+
+        assert_eq!(
+            search_theme(&theme, "lume-probe").map(|(_, p)| p),
+            Some(dir.join("lume-probe.png"))
+        );
+        assert!(search_theme(&theme, "lume-absent").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The 48x48 icon must win over the 16x16 one, or every icon renders
+    /// upscaled and blurry.
+    #[test]
+    fn largest_size_wins_within_a_theme() {
+        let base = std::env::temp_dir().join("lume-icon-test-pick");
+        let theme = base.join("LumePickTheme");
+        for d in ["16x16/apps", "256x256/apps", "scalable/apps"] {
+            std::fs::create_dir_all(theme.join(d)).unwrap();
+        }
+        std::fs::write(
+            theme.join("index.theme"),
+            "[Icon Theme]\nDirectories=16x16/apps,256x256/apps,scalable/apps\n",
+        )
+        .unwrap();
+        std::fs::write(theme.join("16x16/apps/pick.png"), b"x").unwrap();
+        std::fs::write(theme.join("256x256/apps/pick.png"), b"x").unwrap();
+        std::fs::write(theme.join("scalable/apps/pick.svg"), b"x").unwrap();
+
+        assert_eq!(
+            search_theme(&theme, "pick").map(|(_, p)| p),
+            Some(theme.join("scalable/apps/pick.svg"))
+        );
+
+        std::fs::remove_file(theme.join("scalable/apps/pick.svg")).unwrap();
+        assert_eq!(
+            search_theme(&theme, "pick").map(|(_, p)| p),
+            Some(theme.join("256x256/apps/pick.png"))
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

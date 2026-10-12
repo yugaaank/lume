@@ -7,23 +7,51 @@
 //! walks `$XDG_DATA_DIRS/icons/<theme>`, follows `Inherits`, and falls back to
 //! `hicolor` — the same lookup a GTK client does.
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::Duration;
+
 use gpui::{
-    AnyElement, App, Context, FocusHandle, Focusable, IntoElement, Render, Stateful,
-    StatefulInteractiveElement, div,
+    AnyElement, App, Context, FocusHandle, Focusable, IntoElement, Render,
+    StatefulInteractiveElement, Window, div,
     prelude::*, px, rgb,
 };
 use services::apps::AppEntry;
+pub use services::config::DockMode;
 
 use super::DOCK_HEIGHT;
+
+
+/// Floor on how long the dock may stay wrong if the event stream drops an
+/// event. Matches the compositor service's own poll interval, because the two
+/// recover from the same failure.
+pub const DOCK_FLOOR: Duration = Duration::from_secs(5);
+
+/// What the dock decides for itself.
+///
+/// Shared, because two different things feed the decision — the compositor
+/// (are there tiled windows?) and the pointer (is it at the edge?) — and the
+/// surface that owns the window has to read the result. Writing it into two
+/// places is how the dock ends up reserving space it is not drawing.
+#[derive(Default)]
+pub struct DockDemand {
+    /// Pointer is inside the dock or its trigger strip.
+    pub pointer: Cell<bool>,
+    /// The active workspace has no tiled windows.
+    pub empty_workspace: Cell<bool>,
+}
 
 /// An icon resolved against the user's theme, with a themed fallback.
 fn icon(name: &str, size: f32) -> AnyElement {
     let size = px(size);
 
     if let Some(path) = services::icons::resolve(name) {
-        return gpui::img(path.to_string_lossy().into_owned())
-            .size(size)
-            .into_any_element();
+        // A PathBuf, not a String. `impl From<String> for ImageSource` builds
+        // `Resource::Embedded`, which is an asset id looked up through the
+        // AssetSource — a filesystem path passed as a string is silently an
+        // asset that does not exist, and you get a blank rectangle with no
+        // error. `From<PathBuf>` is what yields `Resource::Path`.
+        return gpui::img(path).size(size).into_any_element();
     }
 
     // Not found. A neutral tile is better than a broken image, and the initial
@@ -55,6 +83,11 @@ pub struct Dock {
     hovered: Option<usize>,
     /// Id of the app whose window is focused, if it is a dock item.
     focused_app: Option<String>,
+    mode: DockMode,
+    enabled: bool,
+    trigger_px: f32,
+    demand: Rc<DockDemand>,
+    shown: bool,
 }
 
 pub struct DockItem {
@@ -93,7 +126,91 @@ impl Dock {
             tracing::info!(count = items.len(), "dock populated");
         }
 
-        Self { focus: cx.focus_handle(), items, hovered: None, focused_app: None }
+        let dock = cfg.dock.clone();
+        let shown = dock.enabled && dock.mode == DockMode::AlwaysVisible;
+
+        Self {
+            focus: cx.focus_handle(),
+            items,
+            hovered: None,
+            focused_app: None,
+            mode: dock.mode,
+            enabled: dock.enabled,
+            trigger_px: dock.trigger_px,
+            demand: Rc::new(DockDemand::default()),
+            shown,
+        }
+    }
+
+    pub fn demand(&self) -> Rc<DockDemand> {
+        self.demand.clone()
+    }
+
+    pub fn shown(&self) -> bool {
+        self.shown
+    }
+
+    pub fn mode(&self) -> DockMode {
+        self.mode
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Should the dock reserve space when shown?
+    ///
+    /// Autohide never does: it is an overlay that happens to be on screen, and
+    /// reserving would push windows up for a bar the user chose to hide.
+    pub fn reserves(&self) -> bool {
+        self.mode != DockMode::Autohide
+    }
+
+    pub fn zone(&self) -> f32 {
+        if self.shown && self.reserves() {
+            DOCK_HEIGHT
+        } else {
+            0.0
+        }
+    }
+
+    /// Re-read the compositor and recompute visibility. Cheap: the expensive
+    /// part is skipped unless the mode actually consults it.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let state = cx.global::<services::AppState>();
+        if self.mode == DockMode::Dodge {
+            let empty = !state.compositor.has_tiled_windows();
+            if self.demand.empty_workspace.get() != empty {
+                self.demand.empty_workspace.set(empty);
+            }
+        }
+
+        let shown = self.enabled
+            && match self.mode {
+                DockMode::AlwaysVisible => true,
+                DockMode::Autohide => self.demand.pointer.get(),
+                DockMode::Dodge => self.demand.empty_workspace.get(),
+            };
+
+        if shown != self.shown {
+            self.shown = shown;
+            tracing::debug!(?self.mode, shown, "dock visibility");
+            cx.notify();
+        }
+    }
+
+    fn set_pointer(&mut self, inside: bool, cx: &mut Context<Self>) {
+        if self.demand.pointer.get() != inside {
+            self.demand.pointer.set(inside);
+            self.refresh(cx);
+        }
+    }
+
+    /// Distance from the bottom edge that reveals an autohiding dock. Also the
+    /// height of the trigger strip we keep in the input region, because a
+    /// surface with an empty region gets no pointer events at all.
+    pub fn trigger_px(&self) -> f32 {
+        self.trigger_px
     }
 
     pub fn set_focused_app(&mut self, id: Option<String>, cx: &mut Context<Self>) {
@@ -111,8 +228,17 @@ impl Focusable for Dock {
 }
 
 impl Render for Dock {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity();
+
+        // The pointer is polled from the window rather than tracked through
+        // hover events: while the dock is hidden its input region is a thin
+        // trigger strip, so hover events on the icons never arrive. One read
+        // per render is cheaper than maintaining that state machine.
+        let y = window.mouse_position().y;
+        let in_trigger = y >= window.viewport_size().height - px(self.trigger_px());
+        self.set_pointer(in_trigger || self.hovered.is_some(), cx);
+
         let accent = gpui::hsla(0.60, 0.85, 0.68, 1.0);
 
         let buttons = self.items.iter().enumerate().map(|(i, item)| {

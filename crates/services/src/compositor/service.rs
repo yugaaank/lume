@@ -16,6 +16,16 @@ use tokio::sync::Notify;
 
 use super::{Compositor, Workspace, hyprland};
 
+/// A nudge is coalesced, not counted.
+///
+/// `notify_one`, never `notify_waiters`: waiters that are not *currently*
+/// awaiting are dropped by `notify_waiters`, and the dock spends almost all of
+/// its time in the floor sleep rather than awaiting. Switching that one call
+/// made the dock's dodge mode look dead — the event arrived, nobody was
+/// listening, and it was discarded. `notify_one` stores a permit, so the next
+/// `notified()` returns at once and the coalescing is exactly right: "go
+/// look" is idempotent, so one pending permit loses nothing.
+///
 /// How often the poll re-reads state even when nothing has changed.
 ///
 /// Not a substitute for the event stream — it is the floor that guarantees the
@@ -97,6 +107,34 @@ impl CompositorService {
         self.inner.frame_duration()
     }
 
+    /// Does the active workspace hold a tiled window?
+    ///
+    /// Reads the active workspace live rather than from `self.active`, which
+    /// only the 5 s poll refreshes. Using the cache here made the dock's dodge
+    /// mode lag a workspace switch by up to 5 s: the event arrived instantly
+    /// and was then answered against the workspace the user had just left.
+    ///
+    /// Two `hyprctl` calls, and only when the event stream says something
+    /// changed. Caching this would make the poll interval the dock's reaction
+    /// time, which is the wrong trade for a layout that is already visible.
+    pub fn has_tiled_windows(&self) -> bool {
+        let active = match self.inner.active_workspace() {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::debug!("active_workspace failed: {e:#}");
+                return false;
+            }
+        };
+        let result = self.inner.has_tiled_windows(&active.name);
+        // Logged with the workspace name: "the dock is wrong" is not a
+        // debuggable report without knowing which workspace it asked about.
+        match &result {
+            Ok(tiled) => tracing::debug!(workspace = %active.name, tiled, "dodge query"),
+            Err(e) => tracing::debug!(workspace = %active.name, error = %e, "dodge query failed"),
+        }
+        result.unwrap_or(false)
+    }
+
     pub fn act(&self, action: super::Action) -> anyhow::Result<()> {
         self.inner.act(action)
     }
@@ -115,7 +153,7 @@ fn spawn_poll_loop(
             // one query failed is worse than a shell with slightly stale data.
             if let Ok(list) = compositor.workspaces() {
                 workspaces.store(Arc::new(list));
-                changed.notify_waiters();
+                changed.notify_one();
             } else {
                 tracing::debug!("workspace poll failed");
             }
@@ -123,7 +161,7 @@ fn spawn_poll_loop(
             if let Ok(current) = compositor.active_workspace() {
                 if **active.load() != current {
                     active.store(Arc::new(current));
-                    changed.notify_waiters();
+                    changed.notify_one();
                 }
             }
 
@@ -166,7 +204,7 @@ fn spawn_event_loop(
                             if let Ok(current) = hyprland::Hyprland.active_workspace() {
                                 active.store(Arc::new(current));
                             }
-                            changed.notify_waiters();
+                            changed.notify_one();
                         }
                     });
                 }

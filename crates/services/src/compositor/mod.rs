@@ -91,6 +91,15 @@ pub trait Compositor: Send + Sync {
 
     fn act(&self, action: Action) -> anyhow::Result<()>;
 
+    /// Does `workspace` hold at least one non-floating window?
+    ///
+    /// The dock's "dodge" mode keys off this. Floating windows are excluded
+    /// deliberately: a workspace holding only a floating terminal reads as
+    /// empty on screen, and having the dock fill it is the point.
+    fn has_tiled_windows(&self, _workspace: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Output refresh rate in Hz, for the animation frame interval.
     fn refresh_rate(&self) -> f64 {
         60.0

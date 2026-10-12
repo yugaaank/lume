@@ -88,6 +88,27 @@ impl From<RawWorkspace> for Workspace {
 }
 
 #[derive(serde::Deserialize)]
+struct RawClient {
+    /// Present in 0.56 output; `floating` is a plain bool, not 0/1.
+    #[serde(default)]
+    floating: bool,
+    #[serde(default)]
+    workspace: RawClientWorkspace,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct RawClientWorkspace {
+    #[serde(default)]
+    name: String,
+}
+
+impl RawClient {
+    fn is_tiled(&self) -> bool {
+        !self.floating
+    }
+}
+
+#[derive(serde::Deserialize)]
 struct RawMonitor {
     #[serde(default)]
     #[allow(dead_code)]
@@ -105,6 +126,14 @@ impl Compositor for Hyprland {
     fn active_workspace(&self) -> anyhow::Result<Workspace> {
         let raw: RawWorkspace = query_json(&["-j", "activeworkspace"])?;
         Ok(raw.into())
+    }
+
+    fn has_tiled_windows(&self, workspace: &str) -> anyhow::Result<bool> {
+        let clients: Vec<RawClient> = query_json(&["-j", "clients"])?;
+        Ok(clients
+            .iter()
+            .filter(|c| c.workspace.name == workspace)
+            .any(RawClient::is_tiled))
     }
 
     fn refresh_rate(&self) -> f64 {
