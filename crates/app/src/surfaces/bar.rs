@@ -210,12 +210,17 @@ impl BarView {
         self.active = Some(compositor.active().id);
     }
 
-    fn workspace_pips(&self) -> Vec<Stateful<gpui::Div>> {
+    fn workspace_pips(&self, t: &crate::theme::Palette) -> Vec<Stateful<gpui::Div>> {
         self.workspaces
             .iter()
             .map(|ws| {
                 let is_active = self.active == Some(ws.id);
                 let id = ws.id;
+                let hover_bg = if is_active {
+                    t.ink_a(0.0)
+                } else {
+                    t.surface_hover()
+                };
 
                 div()
                     // Stable per-workspace id. Inside a loop this is not
@@ -225,22 +230,26 @@ impl BarView {
                     // tuples — there is no generic form, so cast.
                     .id(("lume-ws-pip", id as usize))
                     .h(px(20.0))
-                    .px_2()
-                    .rounded(px(4.0))
+                    .min_w(px(20.0))
+                    .px_1()
+                    .rounded(px(services::theme::radius::ROW))
                     .flex()
                     .items_center()
-                    .text_size(px(11.0))
+                    .justify_center()
+                    .text_size(px(services::theme::type_scale::BODY))
                     .cursor_pointer()
-                    .bg(if is_active {
-                        gpui::hsla(0.0, 0.0, 1.0, 0.16)
-                    } else {
-                        gpui::hsla(0.0, 0.0, 0.0, 0.0)
-                    })
-                    .text_color(if is_active {
-                        rgb(0xf0f0f0)
-                    } else {
-                        rgb(0x909090)
-                    })
+                    // The one move the whole design language is built on: the
+                    // active row is an INVERTED pill — bone fill, paper text.
+                    // It is what the reference's selected sidebar row does, and
+                    // it reads as "chosen" without needing any colour at all.
+                    // A tinted highlight would read as "enabled".
+                    .bg(if is_active { t.bone_fill() } else { t.ink_a(0.0) })
+                    .text_color(if is_active { t.ink_on_bone() } else { t.faint() })
+                    // Only the inactive pips take a hover, so hovering the
+                    // active one cannot suggest it can be made more active.
+                    // Computed outside because the hover closure gets a
+                    // `StyleRefinement`, which has no `when`.
+                    .hover(|h| h.bg(hover_bg))
                     .child(gpui::SharedString::from(ws.name.clone()))
                     .on_click(move |_, _window, cx| {
                         // Logged, not surfaced. A failed switch is recoverable
@@ -286,6 +295,15 @@ impl Render for BarView {
         // or right as widgets are added and removed. Equal columns make the
         // middle region genuinely centred at any content width, which is the
         // entire reason it is its own region.
+        //
+        // Those equal columns are also where the two zone rules go. Because the
+        // columns are exactly one third each, a border on the left edge of the
+        // middle and right columns lands at 1/3 and 2/3 of the bar, and stays
+        // there however wide the content is. The reference's ruled "system
+        // dossier" look comes from these two hairlines and nothing else.
+        let gap = px(0.0);
+        let _ = gap;
+
         div()
             .id("lume-bar")
             .h_full()
@@ -293,22 +311,51 @@ impl Render for BarView {
             .flex()
             .items_center()
             .px_3()
-            // Rgba has no .alpha(); alpha is the low byte of an rgba() hex or a
-            // component of hsla().
-            // Paper, not "a dark grey": the bar is the only thing between the
-            // wallpaper and the desktop, and it must be the same black every
-            // preset uses so the shell reads as one object.
-            .bg(t.paper_a(services::theme::alpha::BAR))
+            .bg(t.paper_a(services::theme::alpha::SURFACE))
             .text_color(t.ink_a(1.0))
-            // One family for the whole interface, stated once on the root so
-            // every descendant inherits it.
             .font_family(services::theme::type_scale::FAMILY)
-            // text_size takes an AbsoluteLength, so px(), not a bare float.
             .text_size(px(services::theme::type_scale::BODY))
-            // The single hairline that separates the shell from the desktop.
-            // Without it the bar reads as a band of wallpaper, not as a surface.
+            // The hairline that separates the shell from the desktop. Without
+            // it the bar reads as a band of wallpaper, not as a surface.
             .border_b_1()
-            .border_color(t.line_soft())
+            .border_color(t.line())
+            // The accent spine. Two pixels of the theme's colour down the very
+            // left edge: the cheapest possible statement of "this surface is
+            // the shell", and the one place the accent is load-bearing rather
+            // than decorative. It also gives the bar a left and a right — a
+            // full-width rule with nothing at either end reads as a band of
+            // wallpaper rather than as a surface.
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.0))
+                    .bg(t.accent_a(1.0)),
+            )
+            // The launcher mark, at the far left of the identity region. Click
+            // it and the shell starts doing things, which is why it is first and
+            // why it is the one element allowed to be the accent colour: it is
+            // the shell's own signature, and a theme switch has to be visible
+            // somewhere.
+            .child(
+                div()
+                    // An id is required before any handler: `on_click` makes
+                    // the element stateful, and a stateful element must be
+                    // addressable.
+                    .id("lume-bar-mark")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pr_3()
+                    .cursor_pointer()
+                    .hover(|h| h.bg(t.surface_hover()))
+                    .on_click(move |_, _w, _cx| {
+                        Click::Launcher.send(0.0);
+                    })
+                    .child(identity_mark(&t)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -316,7 +363,10 @@ impl Render for BarView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .children(left.iter().flat_map(|w| self.render_widget(w))),
+                    .border_l_1()
+                    .border_color(t.line_soft())
+                    .pl_3()
+                    .children(left.iter().flat_map(|w| self.render_widget(w, &t))),
             )
             .child(
                 div()
@@ -326,7 +376,9 @@ impl Render for BarView {
                     .items_center()
                     .justify_center()
                     .gap_3()
-                    .children(middle.iter().flat_map(|w| self.render_widget(w))),
+                    .border_l_1()
+                    .border_color(t.line_soft())
+                    .children(middle.iter().flat_map(|w| self.render_widget(w, &t))),
             )
             .child(
                 div()
@@ -336,7 +388,10 @@ impl Render for BarView {
                     .items_center()
                     .justify_end()
                     .gap_3()
-                    .children(right.iter().flat_map(|w| self.render_widget(w))),
+                    .border_l_1()
+                    .border_color(t.line_soft())
+                    .pl_3()
+                    .children(right.iter().flat_map(|w| self.render_widget(w, &t))),
             )
             .into_any_element()
     }
@@ -345,7 +400,11 @@ impl Render for BarView {
 impl BarView {
     /// Render one widget. `Option` because a widget can be unavailable on this
     /// machine right now.
-    fn render_widget(&self, widget: &widgets::Widget) -> Vec<gpui::AnyElement> {
+    fn render_widget(
+        &self,
+        widget: &widgets::Widget,
+        t: &crate::theme::Palette,
+    ) -> Vec<gpui::AnyElement> {
         // Clickable when it leads somewhere. A widget with nothing behind it is
         // not clickable and does not pretend to be — the cursor is the tell,
         // and a pointer cursor over something that does nothing is a lie the
@@ -371,15 +430,15 @@ impl BarView {
                 .items_center()
                 .gap_1()
                 .px_1()
-                .rounded(px(4.0))
-                .text_color(rgb(0xe0e0e0))
+                .rounded(px(services::theme::radius::ROW))
+                .text_color(t.muted())
                 .child(content);
 
             match click {
                 None => base.into_any_element(),
                 Some(a) => base
                     .cursor_pointer()
-                    .hover(|h| h.bg(gpui::hsla(0.0, 0.0, 1.0, 0.10)))
+                    .hover(|h| h.bg(t.control_hover()))
                     .on_click(move |_, w, _cx| {
                         // The pointer is the most accurate answer to "which
                         // widget is this", and the popup is anchored to it.
@@ -401,20 +460,35 @@ impl BarView {
                 .id("lume-bar-workspaces")
                 .flex()
                 .gap_1()
-                .children(self.workspace_pips())
+                .children(self.workspace_pips(t))
                 .into_any_element()];
         }
 
         let Some(out) = (match widget {
-            widgets::Widget::Clock => Some(cell(
-                gpui::SharedString::from(self.status.clock.clone()).into_any_element(),
-            )),
+            // The clock is the bar's anchor and the only thing at full ink.
+            // Everything else is muted or faint, which is what makes the centre
+            // read as the centre rather than as just another widget.
+            widgets::Widget::Clock => Some(
+                cell(div()
+                    .text_size(px(services::theme::type_scale::CLOCK))
+                    .text_color(t.ink_a(1.0))
+                    .child(gpui::SharedString::from(self.status.clock.clone()))
+                    .into_any_element()),
+            ),
             widgets::Widget::Workspaces => None,
             widgets::Widget::Title => Some(cell(
                 gpui::SharedString::from("lume").into_any_element(),
             )),
+            // Status is deliberately one step down from the clock in both size
+            // and contrast. Without that step every widget is the same weight
+            // and the bar has no focal point — which is exactly how this looked
+            // before: correct, and with nothing to look at.
             widgets::Widget::Network if self.status.network_up => Some(cell(
-                gpui::SharedString::from(self.status.network.clone()).into_any_element(),
+                div()
+                    .text_size(px(services::theme::type_scale::SMALL))
+                    .text_color(t.faint())
+                    .child(gpui::SharedString::from(self.status.network.clone()))
+                    .into_any_element(),
             )),
             widgets::Widget::Volume => self.status.volume.as_ref().map(|v| {
                 cell(
@@ -422,6 +496,8 @@ impl BarView {
                         .flex()
                         .items_center()
                         .gap_1()
+                        .text_size(px(services::theme::type_scale::SMALL))
+                        .text_color(t.faint())
                         .child(gpui::SharedString::from(format!("{}%", v.percent())))
                         .into_any_element(),
                 )
@@ -447,6 +523,48 @@ impl BarView {
 
         vec![out]
     }
+}
+
+/// The launcher mark at the head of the bar.
+///
+/// Drawn rather than typed: the reference's identity card is a kanji inside a
+/// bordered box, and that reads as a logo. `LU` typed in the body face would
+/// read as two letters somebody typed.
+///
+/// The bracket corners are four 1px rules in the accent colour. They are the
+/// cheapest available echo of the reference's framing motif, and they are what
+/// makes a theme switch visible on the bar at a glance.
+fn identity_mark(t: &crate::theme::Palette) -> gpui::AnyElement {
+    let arm = 5.0;
+    let a = t.accent_a(1.0);
+    let box_size = px(20.0);
+
+    // Four corner rules, positioned absolutely over a fixed-size box.
+    let corner = |x: f32, y: f32, w: f32, h: f32| {
+        div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).bg(a)
+    };
+
+    div()
+        .relative()
+        .size(box_size)
+        .flex()
+        .items_center()
+        .justify_center()
+        // Sits inside the brackets, so it must be the brighter of the two.
+        .text_color(t.ink_a(1.0))
+        .text_size(px(9.0))
+        .font_weight(gpui::FontWeight::BOLD)
+        .letter_spacing(px(services::theme::type_scale::TRACK_MARK))
+        .child("LU")
+        .child(corner(0.0, 0.0, arm, 1.0))
+        .child(corner(0.0, 0.0, 1.0, arm))
+        .child(corner(f32::from(box_size) - arm, 0.0, arm, 1.0))
+        .child(corner(f32::from(box_size) - 1.0, 0.0, 1.0, arm))
+        .child(corner(0.0, f32::from(box_size) - 1.0, arm, 1.0))
+        .child(corner(0.0, f32::from(box_size) - arm, 1.0, arm))
+        .child(corner(f32::from(box_size) - arm, f32::from(box_size) - 1.0, arm, 1.0))
+        .child(corner(f32::from(box_size) - 1.0, f32::from(box_size) - arm, 1.0, arm))
+        .into_any_element()
 }
 
 /// What a bar widget does when clicked.

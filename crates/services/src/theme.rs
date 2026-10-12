@@ -150,12 +150,17 @@ pub mod alpha {
     pub const FAINT: f32 = 0.68;
     /// The grain overlay.
     pub const GRAIN: f32 = 0.10;
-    /// A panel that must be readable over moving wallpaper. Near-opaque on
-    /// purpose: a menu you read against an animating window is a menu you
-    /// cannot read.
-    pub const PANEL: f32 = 0.985;
-    /// The bar, which sits over the desktop and may stay slightly see-through.
-    pub const BAR: f32 = 0.92;
+    /// A surface that must be readable over anything: the bar, a menu, the
+    /// launcher, the quick settings drawer.
+    ///
+    /// Near-opaque on purpose, and there is no separate "slightly see-through"
+    /// value. A translucent bar was tried and looks like a bug: a fullscreen
+    /// window ignores the bar's exclusive zone, renders underneath it, and its
+    /// text bleeds through at a ratio that reads as a rendering fault rather
+    /// than as depth. Translucency only earns its keep paired with a backdrop
+    /// blur, which the bar does not use. The reference bar is solid black.
+    pub const SURFACE: f32 = 0.985;
+
 }
 
 /// Corner radii.
@@ -191,6 +196,9 @@ pub mod type_scale {
     pub const SECTION: f32 = 10.0;
     /// Row labels, list entries.
     pub const BODY: f32 = 12.0;
+    /// Bar status values. One step below body, and at faint contrast, so the
+    /// clock reads as the bar's anchor rather than as just another widget.
+    pub const SMALL: f32 = 11.0;
     /// The clock.
     pub const CLOCK: f32 = 18.0;
     /// Display type.

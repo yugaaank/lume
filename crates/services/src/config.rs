@@ -178,6 +178,8 @@ impl Default for Appearance {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Bar {
+    /// Which of the four bar geometries to draw.
+    pub style: BarStyle,
     /// Render order. The order in this vec is the order rendered — there is no
     /// separate position field.
     pub widgets: Vec<String>,
@@ -185,9 +187,79 @@ pub struct Bar {
     pub show_seconds: bool,
 }
 
+/// The four bar geometries.
+///
+/// These differ in *geometry*, not decoration: `Single` is one full-width
+/// surface, `Bubbles` is a row of separate rounded islands with no full-width
+/// bar behind them, `Islands` anchors clusters to different screen edges rather
+/// than laying out in one row, and `Framed` is a centred strip with the
+/// workspace pips cut out as a notch. Each reserves a different amount of
+/// screen, so switching one recomputes the layer surface's exclusive zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BarStyle {
+    #[default]
+    Single,
+    Bubbles,
+    Islands,
+    Framed,
+}
+
+impl BarStyle {
+    pub fn id(self) -> &'static str {
+        match self {
+            BarStyle::Single => "single",
+            BarStyle::Bubbles => "bubbles",
+            BarStyle::Islands => "islands",
+            BarStyle::Framed => "framed",
+        }
+    }
+
+    /// The name shown in the settings picker.
+    pub fn title(self) -> &'static str {
+        match self {
+            BarStyle::Single => "Single bar",
+            BarStyle::Bubbles => "Bubbles",
+            BarStyle::Islands => "Edge islands",
+            BarStyle::Framed => "Framed centre",
+        }
+    }
+
+    pub fn all() -> &'static [BarStyle] {
+        &[
+            BarStyle::Single,
+            BarStyle::Bubbles,
+            BarStyle::Islands,
+            BarStyle::Framed,
+        ]
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "single" | "bar" => Some(BarStyle::Single),
+            "bubbles" | "bubble" => Some(BarStyle::Bubbles),
+            "islands" | "island" | "edges" => Some(BarStyle::Islands),
+            "framed" | "frame" => Some(BarStyle::Framed),
+            _ => None,
+        }
+    }
+
+    /// Implemented, or not yet.
+    ///
+    /// Only `Single` is drawn today. The other three are real config values so
+    /// the settings picker can offer them, but rendering one falls back to
+    /// `Single` **and logs**, rather than quietly drawing the wrong thing —
+    /// a style that silently renders as another is worse than one that is not
+    /// offered yet.
+    pub fn implemented(self) -> bool {
+        matches!(self, BarStyle::Single)
+    }
+}
+
 impl Default for Bar {
     fn default() -> Self {
         Self {
+            style: BarStyle::default(),
             widgets: vec![
                 "workspaces".into(),
                 "clock".into(),
