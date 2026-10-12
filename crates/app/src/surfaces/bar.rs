@@ -9,13 +9,57 @@ use gpui::{
 };
 use services::compositor::Action;
 
+use super::widgets;
+
 /// Exclusive zone and height. The registry reads this for geometry.
 pub const BAR_HEIGHT: f32 = 32.0;
+
+/// How often the clock is re-read.
+///
+/// One second, because a clock with seconds needs it. Pure computation — no
+/// I/O, no subprocess — so a tick that renders identically costs a string
+/// compare and nothing else.
+const CLOCK_TICK: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// How often the status widgets are re-read.
+///
+/// Three seconds, and the reason is `wpctl`: reading the default sink shells
+/// out, so one poll a second is one fork, one PipeWire connection and one
+/// ~2 KB pipe read every second, forever. Measured at 0.192% idle CPU.
+///
+/// A volume readout that updates every three seconds is indistinguishable
+/// from one that updates every second — the value only moves when something
+/// moves it, and when the user moves it they are looking at the OSD, not the
+/// bar. Battery and network are plain file reads and are cheap enough that
+/// they could share this tick without complaint.
+const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(3000);
+
+/// Everything a widget renders, as text. Diffed as a whole.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Status {
+    clock: String,
+    network: String,
+    network_signal: Option<services::network::Signal>,
+    volume: Option<services::volume::Volume>,
+    battery: services::battery::Battery,
+    /// Whether the network widget drew anything at all.
+    network_up: bool,
+}
 
 pub struct BarView {
     focus: FocusHandle,
     workspaces: Vec<services::Workspace>,
     active: Option<i64>,
+    widgets: Vec<widgets::Widget>,
+    status: Status,
+    /// What the last render produced, so a tick that changes nothing does not
+    /// repaint a 32px strip across 1920px.
+    rendered: Status,
+    /// The previous byte counters. State, not output, so it is kept out of
+    /// `Status` — putting it there made the change-diff compare a tracker
+    /// that changes on every tick, which is exactly the repaint this is
+    /// meant to avoid.
+    rates: services::network::RateTracker,
 }
 
 impl BarView {
@@ -47,11 +91,58 @@ impl BarView {
         })
         .detach();
 
+        let config = state.config.get();
+        let widgets = widgets::active(&config);
         let mut bar = Self {
             focus: cx.focus_handle(),
             workspaces: Vec::new(),
             active: None,
+            widgets,
+            status: Status::default(),
+            rendered: Status::default(),
+            rates: services::network::RateTracker::new(),
         };
+        bar.refresh_status(cx);
+
+        // One timer for every widget, rather than one task per widget.
+        //
+        // The alternative — twenty-nine tasks each notifying on their own
+        // schedule — repaints the bar continuously for values that mostly have
+        // not changed. Here a tick is one comparison and usually nothing
+        // happens.
+        // Clock: fast, pure.
+        cx.spawn(async move |weak, cx: &mut gpui::AsyncApp| {
+            loop {
+                cx.background_executor().timer(CLOCK_TICK).await;
+                let alive = weak
+                    .update(cx, |bar, cx| {
+                        bar.refresh_clock(cx);
+                        bar.notify_if_changed(cx);
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // Status widgets: slower, because one of them forks a process.
+        cx.spawn(async move |weak, cx: &mut gpui::AsyncApp| {
+            loop {
+                cx.background_executor().timer(STATUS_TICK).await;
+                let alive = weak
+                    .update(cx, |bar, cx| {
+                        bar.refresh_status(cx);
+                        bar.notify_if_changed(cx);
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
         // `compositor` moved into the spawn above; `state` is still ours.
         bar.refresh_from(&state.compositor);
         bar
@@ -59,6 +150,60 @@ impl BarView {
 
     /// Take the handle rather than a Context so this works from both a sync
     /// context and an AsyncApp update.
+    /// Re-read every active widget.
+    ///
+    /// `workspace_pips` is deliberately not touched: those come from the
+    /// compositor's own change signal, which fires exactly when they change,
+    /// and re-reading them on a 1 Hz tick would be 60 wakeups a minute for
+    /// data that does not move.
+    /// Repaint only if something the bar renders actually moved.
+    fn notify_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.status != self.rendered {
+            cx.notify();
+        }
+    }
+
+    /// The clock alone. Separated so the 1 Hz tick never touches the network,
+    /// the battery or `wpctl`.
+    fn refresh_clock(&mut self, cx: &mut Context<Self>) {
+        self.status.clock = services::clock::format(Self::show_seconds(cx)).render(services::clock::now());
+    }
+
+    fn show_seconds(cx: &gpui::App) -> bool {
+        cx.global::<services::AppState>().config.get().bar.show_seconds
+    }
+
+    fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        self.refresh_clock(cx);
+
+        let volume = services::volume::read();
+        self.status.volume = volume.clone();
+
+        if self.widgets.iter().any(|w| *w == widgets::Widget::Battery) {
+            self.status.battery = services::battery::Battery::read();
+        }
+
+        if self.widgets.iter().any(|w| *w == widgets::Widget::Network) {
+            let (interfaces, _) = self.rates.poll();
+            let visible: Vec<_> = interfaces.iter().filter(|i| i.visible() && i.up).collect();
+            self.status.network_up = !visible.is_empty();
+
+            let signals = services::network::signals();
+            self.status.network_signal = visible
+                .first()
+                .and_then(|i| signals.get(&i.name).copied());
+
+            let rates = self.rates.last();
+            self.status.network = if self.status.network_up {
+                let up = services::network::format_rate(rates.tx_per_sec);
+                let down = services::network::format_rate(rates.rx_per_sec);
+                format!("{down} {up}")
+            } else {
+                String::new()
+            };
+        }
+    }
+
     fn refresh_from(&mut self, compositor: &services::CompositorService) {
         // ArcSwap load: an atomic pointer read, never a lock.
         self.workspaces = compositor.workspaces().as_ref().clone();
@@ -125,6 +270,14 @@ impl Render for BarView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         // Pure. No mutation, no window calls, no cx.notify(), no surface
         // setters. All of that belongs in a handler.
+        //
+        // The snapshot of what was last rendered is taken here and nowhere
+        // else, so "did this tick change anything" and "what is on screen" can
+        // never disagree.
+        self.rendered = self.status.clone();
+
+        let (left, right) = widgets::split_by_side(&self.widgets);
+
         div()
             .id("lume-bar")
             .h_full()
@@ -139,7 +292,103 @@ impl Render for BarView {
             .text_color(rgb(0xe8e8e8))
             // text_size takes an AbsoluteLength, so px(), not a bare float.
             .text_size(px(12.0))
-            .child(div().flex().gap_1().children(self.workspace_pips()))
-            .child(gpui::SharedString::from("lume"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(left.iter().flat_map(|w| self.render_widget(w))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .children(right.iter().flat_map(|w| self.render_widget(w))),
+            )
+            .into_any_element()
     }
+}
+
+impl BarView {
+    /// Render one widget. `Option` because a widget can be unavailable on this
+    /// machine right now.
+    fn render_widget(&self, widget: &widgets::Widget) -> Vec<gpui::AnyElement> {
+        let cell = |content: gpui::AnyElement| {
+            div()
+                .id(("lume-bar-cell", hash_name(widget.name())))
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_color(rgb(0xe0e0e0))
+                .child(content)
+                .into_any_element()
+        };
+
+        // Workspaces first and out of the status match: its content is the
+        // compositor's, not a `Status` field. Returning `None` from the match
+        // and bailing there — which is what this did first — skipped the pips
+        // entirely, because the early return came before the append.
+        if *widget == widgets::Widget::Workspaces {
+            return vec![div()
+                .id("lume-bar-workspaces")
+                .flex()
+                .gap_1()
+                .children(self.workspace_pips())
+                .into_any_element()];
+        }
+
+        let Some(out) = (match widget {
+            widgets::Widget::Clock => Some(cell(
+                gpui::SharedString::from(self.status.clock.clone()).into_any_element(),
+            )),
+            widgets::Widget::Workspaces => None,
+            widgets::Widget::Title => Some(cell(
+                gpui::SharedString::from("lume").into_any_element(),
+            )),
+            widgets::Widget::Network if self.status.network_up => Some(cell(
+                gpui::SharedString::from(self.status.network.clone()).into_any_element(),
+            )),
+            widgets::Widget::Volume => self.status.volume.as_ref().map(|v| {
+                cell(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(gpui::SharedString::from(format!("{}%", v.percent())))
+                        .into_any_element(),
+                )
+            }),
+            widgets::Widget::Battery => Some(cell(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(gpui::SharedString::from(
+                        self.status
+                            .battery
+                            .capacity
+                            .map(|p| format!("{p}%"))
+                            .unwrap_or_default(),
+                    ))
+                    .into_any_element(),
+            )),
+            _ => None,
+        }) else {
+            return Vec::new();
+        };
+
+        vec![out]
+    }
+}
+
+/// Stable element-id suffix for a widget name.
+///
+/// `ElementId` tuples take only `usize`, `u64` or `EntityId`, so a runtime
+/// string has to be hashed — exactly as the workspace pips do.
+fn hash_name(name: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    h.finish() as usize
 }

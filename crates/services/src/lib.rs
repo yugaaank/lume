@@ -5,10 +5,14 @@
 
 pub mod apps;
 pub mod compositor;
+pub mod battery;
+pub mod clock;
 pub mod config;
 pub mod desktop;
 pub mod icons;
 pub mod intent;
+pub mod network;
+pub mod volume;
 pub mod ipc;
 
 pub use compositor::{Action, CompositorService, Workspace};
@@ -55,3 +59,51 @@ impl AppState {
 }
 
 pub use ipc::handle;
+
+#[cfg(test)]
+/// Live probes: assert the readers against this machine, not a fixture.
+///
+/// A parser can be perfect on a fixture and wrong on the real thing — the
+/// `wpctl status` and `/proc/net/wireless` bugs both were. These are
+/// `#[ignore]`d so an ordinary `cargo test` stays hermetic and fast; run them
+/// with `cargo test -p services -- --ignored`.
+mod live {
+    #[test]
+    #[ignore = "reads the live system"]
+    fn reads_this_machine() {
+        let battery = crate::battery::Battery::read();
+        println!(
+            "battery: present={} capacity={:?} charging={} glyph={}",
+            battery.present,
+            battery.capacity,
+            battery.charging,
+            battery.glyph()
+        );
+
+        let volume = crate::volume::read();
+        println!("volume: {volume:?}");
+
+        let ifaces = crate::network::interfaces_from(std::path::Path::new("/sys/class/net"));
+        for i in &ifaces {
+            println!(
+                "net: {} up={} rx={} tx={} visible={}",
+                i.name, i.up, i.rx_bytes, i.tx_bytes, i.visible()
+            );
+        }
+        for (name, sig) in crate::network::signals() {
+            println!("signal: {name} link={} dbm={} bars={}", sig.link, sig.dbm, sig.bars());
+        }
+
+        let now = crate::clock::now();
+        println!(
+            "clock: {} | {} | {}",
+            crate::clock::Format::Time.render(now),
+            crate::clock::Format::TimeWithSeconds.render(now),
+            crate::clock::Format::WeekdayTime.render(now)
+        );
+
+        assert!(battery.present, "no battery on this machine");
+        assert!(volume.is_some(), "wpctl returned nothing parseable");
+        assert!(!ifaces.is_empty(), "no interfaces read");
+    }
+}

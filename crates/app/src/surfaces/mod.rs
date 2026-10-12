@@ -45,6 +45,7 @@ pub mod overlay;
 pub mod panel;
 pub mod picker;
 pub mod thumbs;
+pub mod widgets;
 
 pub const SIDEBAR_WIDTH: f32 = 220.0;
 pub const DOCK_HEIGHT: f32 = 64.0;

@@ -39,6 +39,11 @@ rust-embed = "8"
 # build graph.
 image = "0.25"
 
+# Already in the graph via zbus, so this costs no new build. Used for the bar
+# clock, which must show local time including DST - reading /etc/localtime is
+# a compiled TZif blob and reimplementing the rules is not the job.
+chrono = "0.4"
+
 [profile.release]
 opt-level = 2
 lto = "thin"
