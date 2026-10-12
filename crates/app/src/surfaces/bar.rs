@@ -267,7 +267,8 @@ impl Focusable for BarView {
 }
 
 impl Render for BarView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = crate::theme::current(cx);
         // Pure. No mutation, no window calls, no cx.notify(), no surface
         // setters. All of that belongs in a handler.
         //
@@ -294,10 +295,20 @@ impl Render for BarView {
             .px_3()
             // Rgba has no .alpha(); alpha is the low byte of an rgba() hex or a
             // component of hsla().
-            .bg(gpui::hsla(0.10, 0.05, 0.09, 0.92))
-            .text_color(rgb(0xe8e8e8))
+            // Paper, not "a dark grey": the bar is the only thing between the
+            // wallpaper and the desktop, and it must be the same black every
+            // preset uses so the shell reads as one object.
+            .bg(t.paper_a(services::theme::alpha::BAR))
+            .text_color(t.ink_a(1.0))
+            // One family for the whole interface, stated once on the root so
+            // every descendant inherits it.
+            .font_family(services::theme::type_scale::FAMILY)
             // text_size takes an AbsoluteLength, so px(), not a bare float.
-            .text_size(px(12.0))
+            .text_size(px(services::theme::type_scale::BODY))
+            // The single hairline that separates the shell from the desktop.
+            // Without it the bar reads as a band of wallpaper, not as a surface.
+            .border_b_1()
+            .border_color(t.line_soft())
             .child(
                 div()
                     .flex_1()

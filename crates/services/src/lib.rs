@@ -12,6 +12,7 @@ pub mod config;
 pub mod desktop;
 pub mod icons;
 pub mod intent;
+pub mod theme;
 pub mod launcher;
 pub mod network;
 pub mod volume;

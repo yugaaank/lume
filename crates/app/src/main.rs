@@ -1,4 +1,6 @@
+mod fonts;
 mod surfaces;
+mod theme;
 
 use gpui::App;
 use services::{AppState, Command, decode, handle_default, send, serve};
@@ -92,6 +94,12 @@ fn run_shell() -> anyhow::Result<()> {
 
             let compositor = state.compositor.clone();
             cx.set_global(state);
+
+            // Before any surface: a window created before the faces are
+            // registered would lay out with a fallback face and only repaint on
+            // some later change.
+            let loaded = fonts::load(cx);
+            tracing::info!(faces = loaded, "fonts loaded");
 
             surfaces::Surfaces::open_when_ready(cx);
 

@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
+
+use crate::theme;
 use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -134,8 +136,19 @@ impl Default for Desktop {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Appearance {
+    /// Dead on purpose. Light mode inverts the ink/bone roles, so every shadow,
+    /// border and panel opacity needs re-deciding against a light wallpaper. A
+    /// half-implemented light mode is worse than none. See `theme`.
     pub mode: String, // "Dark" | "Light"
-    pub accent: String,
+    /// Which named theme. See `theme::Preset`.
+    pub preset: theme::Preset,
+    /// Overrides `preset`'s accent when set. `None` means "use the preset's".
+    ///
+    /// Not a bare `String` with a default: an unset accent and an accent of
+    /// `"#e2342a"` must behave differently, or a preset whose own accent is red
+    /// could never tell whether the user chose red or never chose at all.
+    pub accent: Option<String>,
+    /// Dead. `theme::type_scale::FAMILY` is the one family; see `theme`.
     pub font_family: String,
     /// When true, accent colours come from the wallpaper palette.
     pub follow_wallpaper: bool,
@@ -151,8 +164,11 @@ impl Default for Appearance {
     fn default() -> Self {
         Self {
             mode: "Dark".into(),
-            accent: "#7aa2f7".into(),
-            font_family: "Inter".into(),
+            preset: theme::Preset::default(),
+            // None, not a default hex: the preset supplies its own accent and
+            // the user should have to opt into overriding it.
+            accent: None,
+            font_family: theme::type_scale::FAMILY.into(),
             follow_wallpaper: true,
             icon_theme: None,
         }
@@ -418,7 +434,7 @@ mod tests {
         let path = dir.join("c.toml");
         let original = Config {
             appearance: Appearance {
-                accent: "#ff0000".into(),
+                accent: Some("#ff0000".into()),
                 ..Default::default()
             },
             ..Default::default()
