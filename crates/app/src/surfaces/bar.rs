@@ -377,7 +377,7 @@ impl Render for BarView {
             // The reference's `shellOuterMargin`: pills are held off the screen
             // edges by 5px. Without it the outer pills sit flush against x=0
             // and their rounded corners and shadow are clipped.
-            .px(px(5.0))
+            .px(px(8.0))
             .flex()
             .items_center()
             .gap_3()
@@ -906,9 +906,9 @@ impl BarShape {
     pub fn of(style: BarStyle) -> Self {
         match style {
             // Flush with the output, one surface, no visible corners.
-            BarStyle::Single => Self { inset: 0.0, continuous: true, plate_h: 0.0 },
+            BarStyle::Single => Self { inset: 8.0, continuous: true, plate_h: 0.0 },
             // Flush, no surface: the regions are the plates.
-            BarStyle::Bubbles => Self { inset: 0.0, continuous: false, plate_h: PLATE_H },
+            BarStyle::Bubbles => Self { inset: 8.0, continuous: false, plate_h: PLATE_H },
             // Lifted off both edges and fully rounded, one surface.
             BarStyle::Framed => Self { inset: 10.0, continuous: true, plate_h: 0.0 },
         }
