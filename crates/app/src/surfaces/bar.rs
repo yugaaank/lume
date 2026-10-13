@@ -287,6 +287,10 @@ impl BarView {
                     .id(("lume-ws-pip", id as usize))
                     .w(px(22.0))
                     .h(px(28.0))
+                    // Never shrink. The pips live in a flex row, so a wide
+                    // value in a neighbouring cell can squeeze them, and a
+                    // squeezed pip wraps its glyph and doubles the bar's height.
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -425,6 +429,12 @@ fn pill(children: Vec<gpui::AnyElement>, t: &crate::theme::Palette, height: f32)
         // it; without the gap a wide value's margin is the only thing separating
         // two readouts, and two of those and the bar looks like a sentence.
         .gap(px(WIDGET_GAP))
+        // The bubble keeps its natural width too. Its cells are already locked
+        // against shrinking, but the bubble is what the column flexes, and a
+        // compressed bubble squeezes its children and clips the last glyph —
+        // "SOMMY 1393" came out as "SOMMY 135" the moment the gap widened.
+        // The bar is the thing that should not fit, not the readouts.
+        .flex_shrink_0()
         .rounded(px(PILL_RADIUS))
         .bg(t.paper_a(services::theme::alpha::PILL))
         .border_1()
@@ -442,7 +452,12 @@ const PILL_RADIUS: f32 = 6.0;
 const WIDGET_PAD: f32 = 8.0;
 
 /// Clear space between two widgets' areas, on top of their margins.
-const WIDGET_GAP: f32 = 2.0;
+///
+/// The reference's `v2WidgetSpacing` is 6. At 2 the widgets still read as one
+/// run — the margin alone was the only thing between two readouts, and two of
+/// those and the status group looks like a sentence. 6 gives each widget a
+/// visibly separate area, which is the whole point of giving them areas.
+const WIDGET_GAP: f32 = 6.0;
 
 impl BarView {
     /// One sector: every widget in it inside a single bubble.
@@ -564,7 +579,16 @@ impl BarView {
             return vec![div()
                 .id("lume-bar-workspaces")
                 .flex()
-                .gap_1()
+                .items_center()
+                // The same area every other widget gets. It used to return its
+                // own bare row with no padding and no shrink lock, so it was the
+                // one widget whose margin and hit box disagreed with the rest —
+                // which is exactly the inconsistency the single WIDGET_PAD
+                // exists to remove.
+                .px(px(WIDGET_PAD))
+                .flex_shrink_0()
+                .h(px(self.shape.plate_h))
+                .rounded(px(services::theme::radius::ROW))
                 .children(self.workspace_pips(t))
                 .into_any_element()];
         }
