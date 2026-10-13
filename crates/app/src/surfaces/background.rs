@@ -34,6 +34,7 @@ pub struct Grid {
     pub padding: f32,
     pub origin: Point<Pixels>,
     pub columns: usize,
+    pub rows: usize,
     /// The display this grid was built for. Kept because the picker needs the
     /// viewport and the grid is what was handed it — deriving it twice from
     /// two sources is how they end up disagreeing.
@@ -46,21 +47,22 @@ impl Grid {
         let padding = 16.0;
         // Leave the top clear so icons never sit under the bar.
         let origin = point(px(padding), px(64.0));
-        let columns =
-            (((f32::from(size.width) - padding) / (cell + padding)).floor() as usize).max(1);
-        Self { cell, padding, origin, columns, display: size }
+        let columns = (((f32::from(size.width) - padding) / (cell + padding)).floor() as usize).max(1);
+        let rows =
+            (((f32::from(size.height) - 64.0 - padding) / (cell + padding)).floor() as usize).max(1);
+        Self { cell, padding, origin, columns, rows, display: size }
     }
 
     pub fn display_size(&self) -> Size<Pixels> {
         self.display
     }
 
-    /// A rect is a pure function of the cell index. That is what makes layout
-    /// reproducible and drag bookkeeping trivial.
+    /// A rect is a pure function of the cell index. Icons flow top-to-bottom
+    /// within a column, then wrap to the next column (Ambxst convention).
     pub fn cell_origin(&self, cell: usize) -> (f32, f32) {
-        let cols = self.columns.max(1);
-        let col = cell % cols;
-        let row = cell / cols;
+        let rows = self.rows.max(1);
+        let col = cell / rows;
+        let row = cell % rows;
         (
             f32::from(self.origin.x) + self.padding + col as f32 * (self.cell + self.padding),
             f32::from(self.origin.y) + self.padding + row as f32 * (self.cell + self.padding),
@@ -74,7 +76,12 @@ impl Grid {
             return None;
         }
         let step = self.cell + self.padding;
-        Some(((y / step).floor() as usize) * self.columns.max(1) + (x / step).floor() as usize)
+        let col = (x / step).floor() as usize;
+        let row = (y / step).floor() as usize;
+        if col >= self.columns.max(1) || row >= self.rows.max(1) {
+            return None;
+        }
+        Some(col * self.rows.max(1) + row)
     }
 
     pub fn rect(&self, cell: usize) -> Bounds<Pixels> {
@@ -792,8 +799,8 @@ fn self_menu(
             div()
                 .id("lume-desktop-menu-scrim")
                 .absolute()
-                .left_0()
-                .top_0()
+                .left(px(0.0))
+                .top(px(1.0))
                 .size_full()
                 .on_click({
                     let this = this.clone();
@@ -820,28 +827,6 @@ fn self_menu(
             MenuAction::OpenTerminal,
             this.clone(),
         ))
-        // Clicking the backdrop closes it. Also handles Esc via the surface's
-        // key handler in the registry.
-        .child(
-            div()
-                .id("lume-desktop-menu-scrim")
-                .absolute()
-                .left_0()
-                .top_0()
-                // The whole surface, not a 1x1 placeholder. This is what a
-                // click outside the menu lands on, and with the input region
-                // widened for the overlay it is the only thing that does.
-                .size_full()
-                .on_click({
-                    let this = this.clone();
-                    move |_, _w, cx| {
-                        this.update(cx, |me, cx| {
-                            me.menu_at = None;
-                            cx.notify();
-                        });
-                    }
-                }),
-        )
         .into_any_element()
 }
 
@@ -867,29 +852,41 @@ fn hash_of(s: &str) -> usize {
 /// copy on top. Two draw calls, no layout change, no shader, and it reads on a
 /// light wallpaper as well as a dark one. Cheaper and more portable than a
 /// plate behind every label.
+/// A label readable on any wallpaper.
+///
+/// No `text_shadow` in this fork, so: a dark copy offset by 1px, then the real
+/// copy on top. Two draw calls, no layout change, no shader, and it reads on a
+/// light wallpaper as well as a dark one. Cheaper and more portable than a
+/// plate behind every label.
 fn label(text: &str, width: f32) -> gpui::Div {
     div()
         .relative()
         .w(px(width))
+        .flex()
+        .flex_col()
+        .items_center()
+        // Black shadow copy, sits 1px below. Absolute so the main text
+        // occupies the flex slot (which becomes size-zero invisible helper).
         .child(
             div()
                 .id(("lume-icon-label-shadow", hash_of(text)))
                 .absolute()
                 .left(px(0.0))
                 .top(px(1.0))
-                .max_w(px(width))
+                .w(px(width))
                 .truncate()
-                .text_size(px(11.0))
-                .text_color(gpui::hsla(0.0, 0.0, 0.0, 0.85))
+                .text_size(px(13.0))
+                .text_align(gpui::TextAlign::Center)
+                .text_color(gpui::hsla(0.0, 0.0, 0.0, 0.92))
                 .child(SharedString::from(text)),
         )
         .child(
             div()
                 .id(("lume-icon-label", hash_of(text)))
-                .max_w(px(width))
-                .truncate()
-                .text_size(px(11.0))
-                .text_color(rgb(0xf0f0f0))
+                .w(px(width))
+                .text_align(gpui::TextAlign::Center)
+                .text_size(px(13.0))
+                .text_color(rgb(0xffffff))
                 .child(SharedString::from(text)),
         )
 }
