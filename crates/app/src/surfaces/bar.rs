@@ -56,6 +56,12 @@ pub struct BarView {
     workspaces: Vec<services::Workspace>,
     active: Option<i64>,
     widgets: Vec<widgets::Widget>,
+    /// The drawn strip's thickness.
+    ///
+    /// Public because the surface reads it to build the bar's input region: a
+    /// region that disagrees with what is painted swallows clicks below the bar,
+    /// or leaves a dead band under it.
+    pub height: f32,
     status: Status,
     /// What the last render produced, so a tick that changes nothing does not
     /// repaint a 32px strip across 1920px.
@@ -98,11 +104,13 @@ impl BarView {
 
         let config = state.config.get();
         let widgets = widgets::active(&config);
+        let height = config.bar.height.clamp(MIN_HEIGHT, MAX_HEIGHT);
         let mut bar = Self {
             focus: cx.focus_handle(),
             workspaces: Vec::new(),
             active: None,
             widgets,
+            height,
             status: Status::default(),
             rendered: Status::default(),
             rates: services::network::RateTracker::new(),
@@ -333,9 +341,14 @@ impl Render for BarView {
         // The zones are still equal-width columns, so the centre one is
         // genuinely centred and its two rules land at 1/3 and 2/3 whatever the
         // content widths.
+        // The surface is the whole output height so it never resizes; the bar
+        // is a strip at the top of it. This div is layout only and paints
+        // nothing — the strip below is the visible bar, and it is the strip the
+        // surface's input region describes.
+        div().size_full().child(
         div()
             .id("lume-bar")
-            .h_full()
+            .h(px(self.height))
             .w_full()
             .flex()
             .items_center()
@@ -416,7 +429,8 @@ impl Render for BarView {
                     .justify_end()
                     .gap_2()
                     .children(right.iter().flat_map(|w| self.render_widget(w, &t))),
-            )
+            ),
+        )
             .into_any_element()
     }
 }

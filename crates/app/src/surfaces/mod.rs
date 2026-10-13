@@ -151,16 +151,23 @@ fn spec_for(
             visible: true,
         },
         Kind::Bar => Spec {
-            // From config, not the constant. The zone and the surface height
-            // must agree exactly or the compositor reserves one amount while
-            // the surface occupies another, which looks like a one-pixel gap
-            // that nothing can explain.
+            // The zone is the bar's thickness; the *surface* is the whole output
+            // height. Those are different numbers on purpose.
+            //
+            // A surface sized to the bar means every change to the bar's height
+            // resizes the layer surface, and the compositor animates that — the
+            // bar visibly slides open and shut when you change one setting. A
+            // full-height surface never resizes, and the input region (pushed
+            // below, in the surface's render) limits pointer input to the strip
+            // that is actually drawn. This is the same shape the dock uses, and
+            // it is what lets a later bar style change its size without
+            // touching the compositor.
             restore_zone: bar_height,
             layer: Layer::Top,
             anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
             keyboard: KeyboardInteractivity::None,
             width: w,
-            height: bar_height,
+            height: h,
             visible: true,
         },
         // Only autohide and dodge start hidden. Always-visible must map with
@@ -927,6 +934,32 @@ impl Render for SurfaceView {
                 window.set_exclusive_zone(want.zone);
                 window.set_input_region(want.region.as_deref());
                 self.pushed = Some(want);
+            }
+        }
+
+        if self.kind == Kind::Bar {
+            // Input is the drawn strip only.
+            //
+            // The surface is the whole output height so it never resizes, which
+            // means the region has to say where the bar actually is — otherwise
+            // an invisible 1200px slab of layer surface would swallow every
+            // click below the bar before it reached the window underneath.
+            // Read off the bar entity rather than from config again: the region
+            // has to describe the strip the bar actually painted, and asking the
+            // bar is the only way to be sure the two agree.
+            let height = self.bar.as_ref().map(|b| b.read(_cx).height);
+            if let Some(height) = height {
+                let strip = gpui::Bounds::new(
+                    gpui::point(px(0.0), px(0.0)),
+                    gpui::size(window.viewport_size().width, px(height)),
+                );
+                let want = Pushed { zone: px(height), region: Some(vec![strip]) };
+                if self.pushed.as_ref() != Some(&want) {
+                    tracing::debug!(height, "bar push");
+                    window.set_exclusive_zone(want.zone);
+                    window.set_input_region(want.region.as_deref());
+                    self.pushed = Some(want);
+                }
             }
         }
 
