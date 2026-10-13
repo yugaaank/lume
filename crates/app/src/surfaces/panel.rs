@@ -63,6 +63,30 @@ pub struct Dock {
     shown: bool,
 }
 
+/// How often the dock re-reads the pointer while autohide is on.
+pub const DOCK_POLL_MS: u64 = 50;
+
+/// One tile's box. The surface needs these to build an input region that
+/// covers the tiles and the peek strip and nothing else, so a visible dock
+/// stops swallowing clicks across the width of the screen.
+pub const TILE: f32 = 52.0;
+/// Gap between tiles.
+pub const TILE_GAP: f32 = 8.0;
+
+impl Dock {
+    /// Horizontal extent of the tile row, centred on the surface.
+    pub fn tiles_bounds(
+        &self,
+        w: gpui::Pixels,
+        h: gpui::Pixels,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        let n = self.items.len() as f32;
+        let width = n * TILE + (n - 1.0).max(0.0) * TILE_GAP;
+        let x = (f32::from(w) - width) / 2.0;
+        gpui::Bounds::new(gpui::point(px(x), px(0.0)), gpui::size(px(width), h))
+    }
+}
+
 pub struct DockItem {
     pub app: AppEntry,
     pub pinned: bool,
@@ -165,6 +189,7 @@ impl Dock {
                 DockMode::Dodge => self.demand.empty_workspace.get(),
             };
 
+
         if shown != self.shown {
             self.shown = shown;
             tracing::debug!(?self.mode, shown, "dock visibility");
@@ -172,6 +197,9 @@ impl Dock {
         }
     }
 
+        /// Distance from the bottom edge that reveals an autohiding dock. Also the
+    /// height of the trigger strip we keep in the input region, because a
+    /// surface with an empty region gets no pointer events at all.
     fn set_pointer(&mut self, inside: bool, cx: &mut Context<Self>) {
         if self.demand.pointer.get() != inside {
             self.demand.pointer.set(inside);
@@ -204,36 +232,52 @@ impl Render for Dock {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity();
 
-        // The pointer is polled from the window rather than tracked through
-        // hover events: while the dock is hidden its input region is a thin
-        // trigger strip, so hover events on the icons never arrive. One read
-        // per render is cheaper than maintaining that state machine.
-        let y = window.mouse_position().y;
-        let in_trigger = y >= window.viewport_size().height - px(self.trigger_px());
-        self.set_pointer(in_trigger || self.hovered.is_some(), cx);
+        // Where the pointer is, read once per render. The surface's timer
+        // supplies the renders; this supplies the answer.
+        //
+        // "Inside" is geometric rather than an event: the pointer is over the
+        // dock when it is anywhere in this surface, which is a band at the
+        // screen edge. That has an off as well as an on, which the earlier
+        // `hovered.is_some()` version did not — hover was only ever set, never
+        // cleared, so the dock latched open the first time a tile was touched.
+        let pos = window.mouse_position();
+        let vp = window.viewport_size();
+        let inside = pos.x >= px(0.0)
+            && pos.y >= px(0.0)
+            && pos.x < vp.width
+            && pos.y < vp.height;
+        if !inside && self.hovered.is_some() {
+            self.hovered = None;
+        }
+        let in_trigger = pos.y >= vp.height - px(self.trigger_px());
+        tracing::debug!(x = f32::from(pos.x), y = f32::from(pos.y), inside, "DBG pos");
+        self.set_pointer(in_trigger || inside, cx);
 
-        let accent = gpui::hsla(0.60, 0.85, 0.68, 1.0);
+        let t = crate::theme::current(cx);
 
         let buttons = self.items.iter().enumerate().map(|(i, item)| {
             let app = item.app.clone();
             let is_focused = self.focused_app.as_deref() == Some(app.id.as_str());
             let is_hovered = self.hovered == Some(i);
 
+            // The plate. Every dock icon sits on its own hairline-bordered
+            // square rather than floating bare on the band: the reference
+            // dock's icons are tiles, and a bare icon on a strip reads as a
+            // list of files. The border is what makes it a tile.
             div()
                 .id(("lume-dock-item", hash_of(&app.id)))
-                // Lifts on hover. A border and a size change are style-only —
-                // no frame loop, nothing animating on its own.
-                .size(px(48.0))
+                .size(px(TILE))
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(10.0))
+                .rounded(px(services::theme::radius::CARD))
+                .border_1()
+                .border_color(if is_focused { t.line_strong() } else { t.line_soft() })
                 .cursor_pointer()
-                .bg(if is_hovered {
-                    gpui::hsla(0.0, 0.0, 1.0, 0.12)
-                } else {
-                    gpui::hsla(0.0, 0.0, 0.0, 0.0)
-                })
+                // Hover is a fill, never a border change: swapping the border
+                // colour would make the tile appear to change size by a pixel.
+                .bg(if is_hovered { t.control_hover() } else { t.ink_a(0.0) })
+                .hover(|h| h.bg(t.control_hover()))
                 .child(icon(&app.icon, &app.name, 40.0))
                 .on_click({
                     let this = this.clone();
@@ -251,21 +295,57 @@ impl Render for Dock {
                 })
                 .on_hover({
                     let this = this.clone();
-                    move |_e, _w, cx| this.update(cx, |me, _cx| me.hovered = Some(i))
+                    move |is_hovered, _w, cx| {
+                        this.update(cx, |me, cx| {
+                            // Both transitions, not just enter. `hovered` is one
+                            // of the two reveal signals, so a tile that never
+                            // reports its leave keeps the dock open for good.
+                            if *is_hovered {
+                                me.hovered = Some(i);
+                            } else if me.hovered == Some(i) {
+                                me.hovered = None;
+                            }
+                            me.refresh(cx);
+                        })
+                    }
                 })
-                // A running-indicator bar under the item. Derived state, so
-                // it repaints only when the set changes — never animated.
+                // The running marker: a corner tick in the accent, drawn in the
+                // tile's top-left. A bar underneath would say "this is the
+                // focused window"; a corner tick says "this app is running",
+                // which is the question a dock actually gets asked, and it is
+                // what the reference does.
                 .child(
                     div()
                         .absolute()
-                        .bottom_0()
-                        .h(px(3.0))
-                        .w(px(20.0))
-                        .rounded_full()
-                        .bg(if is_focused { accent } else { gpui::hsla(0.0, 0.0, 0.0, 0.0) }),
+                        .left_0()
+                        .top_0()
+                        .size(px(12.0))
+                        // Only drawn when running, so this is conditional rather
+                        // than an always-there transparent child.
+                        .child(if is_focused {
+                            div()
+                                .absolute()
+                                .left(px(5.0))
+                                .top(px(5.0))
+                                .size(px(5.0))
+                                .border_l_1()
+                                .border_t_1()
+                                .border_color(t.accent_a(1.0))
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }),
                 )
         });
 
+        // No background at all. Each tile carries its own hairline box and the
+        // wallpaper shows between and around them.
+        //
+        // A container fill was tried here and removed: wrapping the tiles in an
+        // opaque rounded rect regroups them into a single object, and the eye
+        // then reads the whole thing as one bar rather than as a set of apps.
+        // The reference dock has no container either — the tiles float on the
+        // desktop. So the outer div is layout only and paints nothing.
         div()
             .id("lume-dock")
             .size_full()
@@ -274,11 +354,6 @@ impl Render for Dock {
             .items_center()
             .justify_center()
             .gap_2()
-            .px_3()
-            .bg(gpui::hsla(0.10, 0.05, 0.09, 0.86))
-            .border_1()
-            .border_color(gpui::hsla(0.0, 0.0, 1.0, 0.08))
-            .child(div().h_full().min_w(px(8.0)))
             .children(buttons)
     }
 }

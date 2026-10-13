@@ -199,6 +199,9 @@ pub mod type_scale {
     /// Bar status values. One step below body, and at faint contrast, so the
     /// clock reads as the bar's anchor rather than as just another widget.
     pub const SMALL: f32 = 11.0;
+    /// Captions. The reference's tracked micro labels: section headers,
+    /// region names, the marks inside the identity box.
+    pub const TINY: f32 = 8.0;
     /// The clock.
     pub const CLOCK: f32 = 18.0;
     /// Display type.

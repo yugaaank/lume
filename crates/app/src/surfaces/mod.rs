@@ -51,6 +51,11 @@ pub mod widgets;
 
 pub const SIDEBAR_WIDTH: f32 = 220.0;
 pub const DOCK_HEIGHT: f32 = 64.0;
+/// How much of the dock surface stays on screen when the band is slid away.
+///
+/// The reveal target has to survive the hide, or there is nothing to aim at.
+/// Ryoku keeps 3px; 6 is easier to hit on a 1x panel without being visible.
+pub const DOCK_PEEK: f32 = 6.0;
 pub const SLIDE_MS: u64 = 180;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,7 +116,13 @@ struct Spec {
     restore_zone: f32,
 }
 
-fn spec_for(kind: Kind, w: f32, h: f32, dock_mode: panel::DockMode) -> Spec {
+fn spec_for(
+    kind: Kind,
+    w: f32,
+    h: f32,
+    dock_mode: panel::DockMode,
+    bar_height: f32,
+) -> Spec {
     match kind {
         // Full-screen, reserves nothing, and takes keyboard on demand so a
         // modal overlay can be dismissed with the keyboard.
@@ -140,12 +151,16 @@ fn spec_for(kind: Kind, w: f32, h: f32, dock_mode: panel::DockMode) -> Spec {
             visible: true,
         },
         Kind::Bar => Spec {
-            restore_zone: bar::BAR_HEIGHT,
+            // From config, not the constant. The zone and the surface height
+            // must agree exactly or the compositor reserves one amount while
+            // the surface occupies another, which looks like a one-pixel gap
+            // that nothing can explain.
+            restore_zone: bar_height,
             layer: Layer::Top,
             anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
             keyboard: KeyboardInteractivity::None,
             width: w,
-            height: bar::BAR_HEIGHT,
+            height: bar_height,
             visible: true,
         },
         // Only autohide and dodge start hidden. Always-visible must map with
@@ -544,6 +559,16 @@ impl Surfaces {
     }
 
     pub fn open(cx: &mut gpui::App, w: f32, h: f32) -> Self {
+        // Read once here so the spec, the surface and the exclusive zone all
+        // come from the same value in the same frame.
+        let bar_height = cx
+            .global::<AppState>()
+            .config
+            .get()
+            .bar
+            .height
+            .clamp(bar::MIN_HEIGHT, bar::MAX_HEIGHT);
+
         let dock_mode = cx
             .try_global::<AppState>()
             .map(|s| s.config.get().dock.mode)
@@ -557,7 +582,7 @@ impl Surfaces {
             Kind::SidebarRight,
         ]
         .into_iter()
-        .map(|kind| Self::open_one(cx, kind, w, h, dock_mode))
+        .map(|kind| Self::open_one(cx, kind, w, h, dock_mode, bar_height))
         .collect();
 
         let overlay = opened[0].overlay(cx);
@@ -593,8 +618,9 @@ impl Surfaces {
         w: f32,
         h: f32,
         dock_mode: panel::DockMode,
+        bar_height: f32,
     ) -> SurfaceHandle {
-        let s = spec_for(kind, w, h, dock_mode);
+        let s = spec_for(kind, w, h, dock_mode, bar_height);
 
         // Shared with the 'static builder closure, which cannot borrow.
         let initial_region: Arc<std::sync::Mutex<Vec<gpui::Bounds<gpui::Pixels>>>> =
@@ -777,7 +803,37 @@ impl SurfaceView {
         // Nothing else polls: one loop the dock owns is a cost we can point at,
         // whereas five surfaces each polling would be a tax nobody could
         // account for.
+        // Autohide needs to know where the pointer is even when no pointer
+        // event can reach the dock: with the band slid out, nothing is under
+        // the cursor, so nothing is ever delivered and the surface would have
+        // no reason to render and therefore no reason to notice.
+        //
+        // A strip element with a hover handler was tried instead, and cannot
+        // work here: this fork only hit-tests an element that actually paints,
+        // so the reveal target has to be visible to be reachable. Making a 6px
+        // bar at the screen edge visibly red did produce hover events, and any
+        // alpha low enough to be invisible produced none — a framework
+        // behaviour worth relying on right up until it changes.
+        //
+        // So the pointer is read where it is always available, during render,
+        // and a timer supplies the renders. It only runs while autohide is on:
+        // an idle shell must not hold a frame loop open.
         if let Some(dock) = view.dock.clone() {
+            if dock.read(cx).mode() == panel::DockMode::Autohide {
+                let weak = dock.downgrade();
+                cx.spawn(async move |_weak, cx: &mut gpui::AsyncApp| {
+                    loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(panel::DOCK_POLL_MS))
+                            .await;
+                        if weak.update(cx, |_dock, cx| cx.notify()).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+
             let weak = dock.downgrade();
             let changed = cx
                 .try_global::<AppState>()
@@ -878,18 +934,36 @@ impl Render for SurfaceView {
             let h = px(f32::from(window.viewport_size().height));
             let w = window.viewport_size().width;
 
-            // Hidden and autohiding still needs a trigger strip: an empty
-            // input region means the surface never sees the pointer, so an
-            // autohiding dock could never be summoned.
-            let region = if dock.shown() {
+            // Input region = the tiles' own rect, unioned with the peek strip.
+            //
+            // Not the whole surface. A dock with two apps centred on a 1920px
+            // screen occupies about 120px of it, and letting the other 1800 be
+            // clickable means the dock silently eats clicks along the bottom of
+            // the screen. Ryoku draws the same mask for the same reason.
+            //
+            // When the band is away only the bottom strip stays, so the reveal
+            // target exists even while nothing is drawn there.
+            let strip = gpui::Bounds::new(
+                gpui::point(px(0.0), h - px(DOCK_PEEK)),
+                gpui::size(w, px(DOCK_PEEK)),
+            );
+            // The region does NOT change when the dock hides.
+            //
+            // It used to: strip-only while hidden, tiles-plus-strip while shown.
+            // And motion stops arriving the moment the tiles leave the region —
+            // the surface goes quiet, `mouse_position` freezes at whatever it
+            // last saw, and nothing can report that the pointer arrived or left.
+            // The dock then had no way to be summoned *or* dismissed, which is
+            // autohide that never autohides.
+            //
+            // So the tiles stay in the region while the band is away. They are
+            // off screen and invisible then, so the only cost is that the strip
+            // and the tiles' footprint stay clickable — which is the same trade
+            // Ryoku makes, with the same mask.
+            let region = if !dock.enabled() || dock.mode() == panel::DockMode::AlwaysVisible {
                 None
-            } else if dock.mode() == panel::DockMode::Autohide && dock.enabled() {
-                Some(vec![gpui::Bounds::new(
-                    gpui::point(px(0.0), h - px(dock.trigger_px())),
-                    gpui::size(w, px(dock.trigger_px())),
-                )])
             } else {
-                Some(vec![])
+                Some(vec![dock.tiles_bounds(w, h), strip])
             };
 
             let want = Pushed { zone: px(dock.zone()), region };
@@ -949,16 +1023,26 @@ impl Render for SurfaceView {
                 }
                 let (progress, animating) = slide.sample(Instant::now());
                 let travel = 1.0 - progress;
-                let offset = match self.kind {
-                    Kind::SidebarLeft => -travel * SIDEBAR_WIDTH,
-                    Kind::SidebarRight => travel * SIDEBAR_WIDTH,
-                    Kind::Dock => travel * DOCK_HEIGHT,
-                    _ => 0.0,
+                // Per-axis, because the slide axis follows the edge and the edges
+                // are not all the same axis. This used to be one scalar applied
+                // with `.left()`, which is right for a sidebar and silently wrong
+                // for the dock: a bottom dock slid *sideways* out of the surface
+                // and never left, so autohide looked like it did nothing. A
+                // bottom dock has to move on y.
+                let (ox, oy) = match self.kind {
+                    Kind::SidebarLeft => (px(-travel * SIDEBAR_WIDTH), px(0.0)),
+                    Kind::SidebarRight => (px(travel * SIDEBAR_WIDTH), px(0.0)),
+                    // Travel is height minus the peek, so the hidden band ends
+                    // with DOCK_PEEK of it still on screen. Sliding the full
+                    // height left nothing but the strip to hit, which works but
+                    // looks like the dock is falling off the display.
+                    Kind::Dock => (px(0.0), px(travel * (DOCK_HEIGHT - DOCK_PEEK))),
+                    _ => (px(0.0), px(0.0)),
                 };
                 let out = div()
                     .size_full()
                     .relative()
-                    .child(div().absolute().left(px(offset)).top_0().size_full().child(body));
+                    .child(div().absolute().left(ox).top(oy).size_full().child(body));
 
                 // Keep frames coming only while the slide is actually moving.
                 // An idle shell must not hold a frame loop open — that is the

@@ -267,7 +267,10 @@ impl Default for Bar {
                 "volume".into(),
                 "battery".into(),
             ],
-            height: 32.0,
+            // 40, not 32. The bar carries a caption line under each status
+            // value — the reference's tile look — and 32 cannot hold two rows
+            // of text without clipping the descenders.
+            height: 40.0,
             show_seconds: false,
         }
     }
