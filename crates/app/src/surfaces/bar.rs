@@ -373,15 +373,16 @@ impl Render for BarView {
         div()
             .id("lume-bar")
             .h(px(self.height))
-            .when(!self.shape.compact, |d| d.w_full())
+            // Always full width. This was conditional on `compact` and that was
+            // wrong twice over: the three columns are `flex_1`, which is basis 0
+            // plus a share of the free space, so a shrink-to-fit shell has
+            // nothing to share and renders empty — and a shell sized to its
+            // content packs the three regions against each other instead of
+            // putting them at the ends. The shapes differ in their backdrop,
+            // never in whether the layout has room.
+            .w_full()
+            .mx(px(self.shape.inset))
             .flex()
-            // Three equal columns on a full-width shell; natural widths on a
-            // compact one. They cannot be the same thing: `flex_1` is basis 0
-            // plus a share of the free space, and a shrink-to-fit shell has no
-            // free space to share, so a compact bar with three `flex_1` columns
-            // renders empty — measured, not reasoned. The compact shell is
-            // therefore centred as a group, which is the honest behaviour for a
-            // floating capsule anyway: its regions pack and the capsule floats.
             .gap_3()
             .items_center()
             .gap_3()
@@ -400,10 +401,10 @@ impl Render for BarView {
             // A floating shell is detached from the screen edge, so it is
             // outlined all the way round. A flush one has only a bottom edge
             // that is not against the desktop.
-            .when(self.shape.floating, |d| {
+            .when(self.shape.floating(), |d| {
                 d.border_1().border_color(t.line())
             })
-            .when(!self.shape.floating, |d| {
+            .when(!self.shape.floating(), |d| {
                 d.border_b_1().border_color(t.line())
             })
             // The accent spine down the left edge, plus a matching tick at the
@@ -416,23 +417,31 @@ impl Render for BarView {
             // Identity: the mark, then the workspace strip.
             .child(
                 div()
-                    .when(!self.shape.compact, |d| d.flex_1())
+                    .flex_1()
                     .h_full()
                     .flex()
                     .items_center()
                     .gap_2()
                     .when(self.shape.continuous, |d| d.pl_3())
                     // Bubbles has no surface behind it, so the regions are the
-                    // plates. Without this the only difference between it and
-                    // Framed is whether a surface is painted — two styles that
-                    // differ by one fill are one style.
-                    .when(!self.shape.continuous, |d| {
-                        d.rounded(px(services::theme::radius::TILE))
-                            .border_1()
-                            .border_color(t.line())
-                            .px_2()
-                    })
+                    // plates. The plate is an inner element rather than the
+                    // region itself: a region is a third of the bar, and a
+                    // bordered third is a bordered third, not a plate around
+                    // some widgets. The region keeps the third so the clock
+                    // stays centred; the plate shrinks to what is in it.
                     .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(!self.shape.continuous, |d| {
+                                d.rounded(px(services::theme::radius::TILE))
+                                    .border_1()
+                                    .border_color(t.line())
+                                    .px_2()
+                                    .py_1()
+                            })
+                            .child(
                         div()
                             .id("lume-bar-mark")
                             .flex()
@@ -459,11 +468,12 @@ impl Render for BarView {
                                     .child("LUME"),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .children(self.workspace_pips(&t)),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .children(self.workspace_pips(&t)),
+                            ),
                     ),
             )
             // Centre: the clock, boxed so it reads as the primary instrument.
@@ -473,7 +483,7 @@ impl Render for BarView {
             // comment above says so, and until now nothing drew it.
             .child(
                 div()
-                    .when(!self.shape.compact, |d| d.flex_1())
+                    .flex_1()
                     .h_full()
                     .flex()
                     .items_center()
@@ -481,37 +491,50 @@ impl Render for BarView {
                     // The rule at 1/3, which only means anything where the
                     // columns are thirds of the bar. A compact shell packs its
                     // regions, so there is no third to rule.
-                    .when(!self.shape.compact, |d| {
+                    .when(self.shape.continuous, |d| {
                         d.border_l_1().border_color(t.line())
                     })
-                    .when(!self.shape.continuous, |d| {
-                        d.rounded(px(services::theme::radius::TILE))
-                            .border_1()
-                            .border_color(t.line())
-                            .px_2()
-                    })
-                    .children(middle.iter().flat_map(|w| self.render_widget(w, &t))),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .when(!self.shape.continuous, |d| {
+                                d.rounded(px(services::theme::radius::TILE))
+                                    .border_1()
+                                    .border_color(t.line())
+                                    .px_3()
+                                    .py_1()
+                            })
+                            .children(middle.iter().flat_map(|w| self.render_widget(w, &t))),
+                    ),
             )
             // Status. Its left border is the rule at 2/3.
             .child(
                 div()
-                    .when(!self.shape.compact, |d| d.flex_1())
+                    .flex_1()
                     .h_full()
                     .flex()
                     .items_center()
                     .justify_end()
-                    .when(!self.shape.compact, |d| {
+                    .when(self.shape.continuous, |d| {
                         d.border_l_1().border_color(t.line())
                     })
                     .when(self.shape.continuous, |d| d.pr_3())
                     .gap_2()
-                    .when(!self.shape.continuous, |d| {
-                        d.rounded(px(services::theme::radius::TILE))
-                            .border_1()
-                            .border_color(t.line())
-                            .px_2()
-                    })
-                    .children(right.iter().flat_map(|w| self.render_widget(w, &t))),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(!self.shape.continuous, |d| {
+                                d.rounded(px(services::theme::radius::TILE))
+                                    .border_1()
+                                    .border_color(t.line())
+                                    .px_2()
+                                    .py_1()
+                            })
+                            .children(right.iter().flat_map(|w| self.render_widget(w, &t))),
+                    ),
             ),
         )
             )
@@ -733,33 +756,37 @@ fn tile(caption: &'static str, value: String, t: &crate::theme::Palette) -> gpui
 /// four-edge frame: a different surface model, not a shape. It used to be a
 /// variant that fell back to `Single` and logged, which is worse than not
 /// offering it at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BarShape {
-    /// The shell hugs its content instead of spanning the output.
-    pub compact: bool,
-    /// One continuous surface behind the whole strip. When false, each region
-    /// is its own rounded plate instead.
+    /// Gap between the shell and the left and right screen edges. Zero is a bar
+    /// flush with the output, which is what `Single` is.
+    pub inset: f32,
+    /// One continuous surface behind the whole strip. When false, each region is
+    /// its own rounded plate instead.
     pub continuous: bool,
-    /// The shell is detached from the screen edge, so every corner rounds.
-    pub floating: bool,
 }
 
 impl BarShape {
     pub fn of(style: BarStyle) -> Self {
         match style {
-            // Spans the output; square where it sits flush with a screen edge.
-            BarStyle::Single => Self { compact: false, continuous: true, floating: false },
-            // Content width, floating, and no surface — the regions are plates.
-            BarStyle::Bubbles => Self { compact: true, continuous: false, floating: true },
-            // Content width, floating, with one surface over the whole strip.
-            BarStyle::Framed => Self { compact: true, continuous: true, floating: true },
+            // Flush with the output, one surface, no visible corners.
+            BarStyle::Single => Self { inset: 0.0, continuous: true },
+            // Flush, no surface: the regions are the plates.
+            BarStyle::Bubbles => Self { inset: 0.0, continuous: false },
+            // Lifted off both edges and fully rounded, one surface.
+            BarStyle::Framed => Self { inset: 10.0, continuous: true },
         }
+    }
+
+    /// Detached from the screen edge, so the shell has corners worth rounding.
+    fn floating(&self) -> bool {
+        self.inset > 0.0
     }
 
     /// Radius for the shell. A bar flush against the screen edge has no visible
     /// corners to round, so it keeps none.
     fn radius(&self) -> f32 {
-        if self.floating {
+        if self.floating() {
             services::theme::radius::CARD
         } else {
             services::theme::radius::CARET
