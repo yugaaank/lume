@@ -44,6 +44,9 @@ const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(3000);
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Status {
     clock: String,
+    /// The date label, `Tue 13`. The reference's centre group is time and date
+    /// at two sizes, so they are two fields rather than one composed string.
+    date: String,
     network: String,
     /// The SSID of the network this machine is on, or empty when wired or
     /// down. The widget shows this beside the glyph rather than a byte rate:
@@ -60,7 +63,10 @@ pub struct BarView {
     focus: FocusHandle,
     workspaces: Vec<services::Workspace>,
     active: Option<i64>,
-    widgets: Vec<widgets::Widget>,
+    /// The three sectors. Placement is the config's, not the registry's.
+    left: Vec<widgets::Widget>,
+    centre: Vec<widgets::Widget>,
+    right: Vec<widgets::Widget>,
     /// The drawn strip's thickness.
     ///
     /// Public because the surface reads it to build the bar's input region: a
@@ -111,14 +117,16 @@ impl BarView {
         .detach();
 
         let config = state.config.get();
-        let widgets = widgets::active(&config);
+        let (left, centre, right) = widgets::active_sectors(&config);
         let height = config.bar.height.clamp(MIN_HEIGHT, MAX_HEIGHT);
         let shape = BarShape::of(config.bar.style);
         let mut bar = Self {
             focus: cx.focus_handle(),
             workspaces: Vec::new(),
             active: None,
-            widgets,
+            left,
+            centre,
+            right,
             height,
             shape,
             status: Status::default(),
@@ -188,8 +196,20 @@ impl BarView {
 
     /// The clock alone. Separated so the 1 Hz tick never touches the network,
     /// the battery or `wpctl`.
+    /// Whether the configured bar contains a widget.
+    ///
+    /// Polling a service the user never put on the bar is the thing this
+    /// guards: the network and volume readers shell out, and doing that every
+    /// tick for a hidden widget is pure cost.
+    fn has(&self, key: &str) -> bool {
+        [&self.left, &self.centre, &self.right]
+            .iter()
+            .any(|row| row.iter().any(|w| w.key == key))
+    }
+
     fn refresh_clock(&mut self, cx: &mut Context<Self>) {
         self.status.clock = services::clock::format(Self::show_seconds(cx)).render(services::clock::now());
+        self.status.date = services::clock::Format::DateOnly.render(services::clock::now());
     }
 
     fn show_seconds(cx: &gpui::App) -> bool {
@@ -202,11 +222,11 @@ impl BarView {
         let volume = services::volume::read();
         self.status.volume = volume.clone();
 
-        if self.widgets.iter().any(|w| w.key == "battery") {
+        if self.has("battery") {
             self.status.battery = services::battery::Battery::read();
         }
 
-        if self.widgets.iter().any(|w| w.key == "network") {
+        if self.has("network") {
             let (interfaces, _) = self.rates.poll();
             let visible: Vec<_> = interfaces.iter().filter(|i| i.visible() && i.up).collect();
             self.status.network_up = !visible.is_empty();
@@ -242,76 +262,46 @@ impl BarView {
         self.active = Some(compositor.active().id);
     }
 
-    /// The workspace row: one connected strip, not a row of loose pills.
+    /// The workspace row: kanji numerals, one cell per workspace.
     ///
-    /// A hairline on the leading edge of every cell but the first welds them
-    /// into a single segmented control, which is what they are. Loose rounded
-    /// pills read as unrelated buttons; a joined strip reads as one selector.
+    /// The reference's `kanji` style. 一二三四五 at 1..=10 and the raw id
+    /// above that, because those glyphs are the reference's own choice and they
+    /// read as a sequence rather than as five unrelated digits.
     ///
-    /// The active cell carries a `//` prefix, borrowed from the reference's
-    /// selected sidebar rows. It costs three characters and it is the single
-    /// detail that makes the strip look considered rather than default.
+    /// The active cell is marked by being *larger and brighter* — 15px at full
+    /// ink against 13px at 0.7 or 0.3 — with no box, no fill and no underline.
+    /// An inverted pill was tried first and it fought the rest of the bar: the
+    /// cells became the only filled things in a row of quiet text, so the eye
+    /// went to the workspace strip instead of the clock.
     fn workspace_pips(&self, t: &crate::theme::Palette) -> Vec<gpui::AnyElement> {
         self.workspaces
             .iter()
-            .enumerate()
-            .map(|(i, ws)| {
+            .map(|ws| {
                 let is_active = self.active == Some(ws.id);
                 let id = ws.id;
-                let hover_bg = if is_active {
-                    t.ink_a(0.0)
-                } else {
-                    t.surface_hover()
-                };
 
                 div()
                     // Stable per-workspace id. Inside a loop this is not
                     // optional: without it every cell shares one global element
                     // id and the hit-test tree is rebuilt every frame.
-                    // ElementId accepts only (&'static str, usize|u64|EntityId)
-                    // tuples — there is no generic form, so cast.
                     .id(("lume-ws-pip", id as usize))
-                    .h(px(24.0))
-                    .px_2()
+                    .w(px(22.0))
+                    .h(px(28.0))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .gap_1()
-                    .text_size(px(services::theme::type_scale::SMALL))
                     .cursor_pointer()
-                    // The separator. Suppressed on the first cell so the strip
-                    // has no left edge, and drawn on the leading edge of the
-                    // rest so the weld runs the way the cells read.
-                    .when(i > 0, |d| d.border_l_1().border_color(t.line_soft()))
-                    // The one move the whole design language is built on: the
-                    // active cell is an INVERTED pill — bone fill, paper text.
-                    // It reads as "chosen" without needing any colour, which a
-                    // tinted highlight cannot do: tint reads as "enabled".
-                    .bg(if is_active { t.bone_fill() } else { t.ink_a(0.0) })
-                    .text_color(if is_active { t.ink_on_bone() } else { t.faint() })
-                    // Only inactive cells take a hover. Hovering the active one
-                    // would suggest it can be made more active.
-                    .hover(|h| h.bg(hover_bg))
-                    .child(if is_active {
-                        div()
-                            .text_color(t.ink_on_bone())
-                            .child("//")
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
+                    .hover(|h| h.text_color(t.ink_a(1.0)))
+                    // The CJK face, because the mono has no kanji and would
+                    // render 一 as tofu. See `fonts::CJK_FACE`.
+                    .font_family(crate::fonts::CJK_FAMILY)
+                    .text_size(px(if is_active { 15.0 } else { 13.0 }))
+                    .text_color(match (is_active, ws.windows) {
+                        (true, _) => t.ink_a(1.0),
+                        (false, n) if n > 0 => t.ink_a(0.7),
+                        (false, _) => t.ink_a(0.3),
                     })
-                    .child(gpui::SharedString::from(ws.name.clone()))
-                    .on_click(move |_, _window, cx| {
-                        // Logged, not surfaced. A failed switch is recoverable
-                        // and must not take the bar down with it.
-                        if let Err(e) = cx
-                            .global::<services::AppState>()
-                            .compositor
-                            .act(Action::FocusWorkspace { id })
-                        {
-                            tracing::warn!(?id, "workspace switch failed: {e:#}");
-                        }
-                    })
+                    .child(gpui::SharedString::from(kanji_workspace(id)))
                     .into_any_element()
             })
             .collect()
@@ -337,7 +327,7 @@ impl Render for BarView {
         // never disagree.
         self.rendered = self.status.clone();
 
-        let (left, middle, right) = widgets::split_by_side(&self.widgets);
+        let (left, middle, right) = (&self.left, &self.centre, &self.right);
 
         // Three equal columns rather than justify_between with three children.
         //
@@ -368,199 +358,109 @@ impl Render for BarView {
         // nothing — the strip below is the visible bar, and it is the strip the
         // surface's input region describes.
         div().size_full().child(
-        // The shell. A full-width bar is the centring row's whole width; a
-        // compact one shrinks to its content and this centres it. One renderer,
-        // one conditional — which is the difference between a style being a
-        // parameter and being a second bar.
-        div()
-            .h_full()
-            .w_full()
-            .flex()
-            // Centre along the bar's own axis only. `items_center` works both
-            // axes, which put a compact shell in the middle of the screen —
-            // the surface is full height now, so cross-axis centring has
-            // something to centre against.
-            .justify_center()
-            .items_start()
-            .child(
+        // The shell. Three equal columns, each holding a row of floating pills.
+        // There is no continuous band behind them: the reference's islands mode
+        // hides the band and lets the wallpaper show between the pills, and a
+        // band would turn four plates into one bar with boxes drawn on it.
+        //
+        // Equal columns, not `justify_between`, because with justify_between the
+        // clock is only centred while the two outer groups happen to be the same
+        // width — it drifts as widgets come and go.
         div()
             .id("lume-bar")
             .h(px(self.height))
-            // Always full width. This was conditional on `compact` and that was
-            // wrong twice over: the three columns are `flex_1`, which is basis 0
-            // plus a share of the free space, so a shrink-to-fit shell has
-            // nothing to share and renders empty — and a shell sized to its
-            // content packs the three regions against each other instead of
-            // putting them at the ends. The shapes differ in their backdrop,
-            // never in whether the layout has room.
             .w_full()
-            .mx(px(self.shape.inset))
+            // The reference's `shellOuterMargin`: pills are held off the screen
+            // edges by 5px. Without it the outer pills sit flush against x=0
+            // and their rounded corners and shadow are clipped.
+            .px(px(5.0))
             .flex()
-            .gap_3()
             .items_center()
             .gap_3()
-            // No horizontal padding here; the two outer zones carry it, so the
-            // strip's content box is the full bar width.
-            // The surface, when this shape has one. `Bubbles` has none: its
-            // regions are the plates, and a surface behind them would make the
-            // two shapes the same drawing.
-            .when(self.shape.continuous, |d| {
-                d.bg(t.paper_a(services::theme::alpha::SURFACE))
-                    .rounded(px(self.shape.radius()))
-            })
-            .text_color(t.ink_a(1.0))
             .font_family(services::theme::type_scale::FAMILY)
-            .text_size(px(services::theme::type_scale::BODY))
-            // A floating shell is detached from the screen edge, so it is
-            // outlined all the way round. A flush one has only a bottom edge
-            // that is not against the desktop.
-            //
-            // Both rules belong to the surface, so neither is drawn when there
-            // is no surface. `Bubbles` painted a full-width hairline across the
-            // desktop with nothing behind it: a border outlines a fill, and
-            // there was no fill to outline.
-            .when(self.shape.floating(), |d| {
-                d.border_1().border_color(t.line())
-            })
-            .when(!self.shape.floating() && self.shape.continuous, |d| {
-                d.border_b_1().border_color(t.line())
-            })
-            // The accent spine down the left edge, plus a matching tick at the
-            // right. Two pixels of theme colour at each end: the bar is the
-            // only always-present surface, so it is where the shell states
-            // what it is, and the spine is where a theme switch has to be
-            // visible.
-            .child(div().absolute().left_0().top_0().bottom_0().w(px(2.0)).bg(t.accent_a(1.0)))
-            .child(div().absolute().right_0().top_0().bottom_0().w(px(2.0)).bg(t.accent_a(1.0)))
-            // Identity: the mark, then the workspace strip.
-            .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(self.shape.continuous, |d| d.pl_3())
-                    // Bubbles has no surface behind it, so the regions are the
-                    // plates. The plate is an inner element rather than the
-                    // region itself: a region is a third of the bar, and a
-                    // bordered third is a bordered third, not a plate around
-                    // some widgets. The region keeps the third so the clock
-                    // stays centred; the plate shrinks to what is in it.
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .when(!self.shape.continuous, |d| {
-                                d.rounded(px(services::theme::radius::TILE))
-                                    .border_1()
-                                    .border_color(t.line())
-                                    .px_2()
-                                    .h(px(self.shape.plate_h))
-                            })
-                            .child(
-                        div()
-                            .id("lume-bar-mark")
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .h(px(24.0))
-                            .rounded(px(services::theme::radius::ROW))
-                            .border_1()
-                            .border_color(t.line())
-                            .cursor_pointer()
-                            .hover(|h| h.bg(t.surface_hover()))
-                            .on_click(move |_, _w, _cx| Click::Launcher.send(0.0))
-                            .child(identity_mark(&t))
-                            .child(
-                                // The mark's caption. Present rather than
-                                // decorative: the reference labels every region
-                                // of its interface, and an unlabelled box is a
-                                // box with no idea what it is.
-                                div()
-                                    .text_size(px(services::theme::type_scale::TINY))
-                                    .text_color(t.faint())
-                                    .letter_spacing(px(services::theme::type_scale::TRACK_MARK))
-                                    .child("LUME"),
-                            ),
-                    )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .children(self.workspace_pips(&t)),
-                            ),
-                    ),
-            )
-            // Centre: the clock, boxed so it reads as the primary instrument.
-            //
-            // The left border is the rule at 1/3. It lands there because the
-            // columns are equal, which is the one thing the layout is for — the
-            // comment above says so, and until now nothing drew it.
-            .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    // The rule at 1/3, which only means anything where the
-                    // columns are thirds of the bar. A compact shell packs its
-                    // regions, so there is no third to rule.
-                    .when(self.shape.continuous, |d| {
-                        d.border_l_1().border_color(t.line())
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .when(!self.shape.continuous, |d| {
-                                d.rounded(px(services::theme::radius::TILE))
-                                    .border_1()
-                                    .border_color(t.line())
-                                    .px_3()
-                                    .py_1()
-                            })
-                            .children(middle.iter().flat_map(|w| self.render_widget(w, &t))),
-                    ),
-            )
-            // Status. Its left border is the rule at 2/3.
-            .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .when(self.shape.continuous, |d| {
-                        d.border_l_1().border_color(t.line())
-                    })
-                    .when(self.shape.continuous, |d| d.pr_3())
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .when(!self.shape.continuous, |d| {
-                                d.rounded(px(services::theme::radius::TILE))
-                                    .border_1()
-                                    .border_color(t.line())
-                                    .px_2()
-                                    .h(px(self.shape.plate_h))
-                            })
-                            .children(right.iter().flat_map(|w| self.render_widget(w, &t))),
-                    ),
-            ),
+            .text_color(t.ink_a(1.0))
+            .text_size(px(services::theme::type_scale::WIDGET))
+            .child(self.render_row(&left, RowAlign::Start, &t))
+            .child(self.render_row(&middle, RowAlign::Centre, &t))
+            .child(self.render_row(&right, RowAlign::End, &t)),
         )
-            )
             .into_any_element()
     }
 }
 
+/// A workspace id as its kanji numeral, or the raw id above ten.
+///
+/// The reference's mapping, and it stops at ten on purpose: past that the
+/// numerals stop being a sequence and start being a lookup table nobody can
+/// hold in their head, so a workspace 11 shows `11`.
+fn kanji_workspace(id: i64) -> String {
+    const KANJI: [&str; 10] = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"];
+    match id {
+        1..=10 => KANJI[(id - 1) as usize].to_string(),
+        // Special workspaces are negative and have their own names; showing a
+        // number for one would claim it is an ordinary workspace.
+        _ => id.to_string(),
+    }
+}
+
+/// Which end of its column a row sits at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAlign {
+    Start,
+    Centre,
+    End,
+}
+
+
+/// One floating plate: a run of widgets on paper, hairline border, full bar
+/// height, so the pills read as objects sitting *on* the desktop rather than as
+/// rows of text with boxes drawn around them.
+fn pill(children: Vec<gpui::AnyElement>, t: &crate::theme::Palette, height: f32) -> gpui::AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .h(px(height))
+        .rounded(px(PILL_RADIUS))
+        .bg(t.paper_a(services::theme::alpha::PILL))
+        .border_1()
+        .border_color(t.pill_border())
+        .children(children)
+        .into_any_element()
+}
+
+/// The pill's corner radius. The reference's `barCornerRadius`.
+const PILL_RADIUS: f32 = 6.0;
+
 impl BarView {
+    /// One sector: every widget in it inside a single bubble.
+    fn render_row(
+        &self,
+        widgets: &[widgets::Widget],
+        align: RowAlign,
+        t: &crate::theme::Palette,
+    ) -> gpui::AnyElement {
+        let row = div().flex_1().h_full().flex().items_center().gap_3();
+        let row = match align {
+            RowAlign::Start => row.justify_start(),
+            RowAlign::Centre => row.justify_center(),
+            RowAlign::End => row.justify_end(),
+        };
+        // One bubble per sector. The reference splits a sector into several
+        // pills at each separator; lume deliberately does not. A sector is one
+        // group, and splitting it turns the bar into a row of unrelated boxes —
+        // and it moves the seams every time a widget is added or removed,
+        // which is exactly when the user is trying to read the bar.
+        //
+        // One bubble per sector is also what makes placement visible: move a
+        // widget between sectors and it visibly joins a different group.
+        let children: Vec<gpui::AnyElement> =
+            widgets.iter().flat_map(|w| self.render_widget(w, t)).collect();
+        if children.is_empty() {
+            return row.into_any_element();
+        }
+        row.child(pill(children, t, self.height)).into_any_element()
+    }
+
     /// Render one widget. `Option` because a widget can be unavailable on this
     /// machine right now.
     fn render_widget(
@@ -644,80 +544,83 @@ impl BarView {
                 .into_any_element()];
         }
 
+        // Every widget is icon + value. The bar reads as one instrument
+        // because every element in it has the same shape, the way the
+        // reference's does; a widget that is only a number reads as an outage
+        // of the ones that carry an icon.
+        //
+        // A ghost renders its icon alone, dimmed. It occupies its final
+        // position and claims nothing about the system, which is the honest
+        // state of a widget with no data source behind it yet.
         let Some(out) = (match widget.key {
-            // The clock is the bar's anchor and the only thing at full ink.
-            // Everything else is muted or faint, which is what makes the centre
-            // read as the centre rather than as just another widget.
-            "clock" => Some(
-                cell(div()
-                    .text_size(px(services::theme::type_scale::CLOCK))
-                    .text_color(t.ink_a(1.0))
-                    .child(gpui::SharedString::from(self.status.clock.clone()))
-                    .into_any_element()),
-            ),
-            "workspaces" => None,
-            "title" => Some(cell(
-                gpui::SharedString::from("lume").into_any_element(),
+            "clock" => Some(cell(div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(services::theme::type_scale::CLOCK))
+                        .letter_spacing(px(1.0))
+                        .text_color(t.ink_a(1.0))
+                        .child(gpui::SharedString::from(self.status.clock.clone())),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .letter_spacing(px(0.5))
+                        .text_color(t.ink_a(0.5))
+                        .child(gpui::SharedString::from(self.status.date.clone())),
+                )
+                .into_any_element())),
+            "launcher" => Some(cell(
+                div()
+                    .text_size(px(17.0))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(t.accent_a(1.0))
+                    .child(gpui::SharedString::from(widget.icon.to_string()))
+                    .into_any_element(),
             )),
-            // Status is a caption over a value, in a hairline box.
-            //
-            // Stacking them is what buys the bar its vertical room, and the
-            // reference does exactly this in its quick settings tiles: a tracked
-            // micro label over the live number. It also fixes the flatness that
-            // made the first version look like text somebody typed — a bare
-            // "25%" says nothing about what is at 25%.
-            // `tile` is content, not a cell. It has no `.id` and no `on_click`, so
-            // returning one directly produces a tile that looks clickable and
-            // is not — which is exactly what network and volume were. Every
-            // clickable widget has to go through `cell`.
-            //
-            // No `network_up` guard: a downed network used to render nothing,
-            // which left no way to reach the panel and reconnect. Showing the
-            // glyph with no SSID is the fix.
             "network" => {
                 // Glyph by link quality, so the bar says something useful
-                // before the name is read. `bars()` is 0..=4, not 0..=3.
+                // before the name is read. `bars()` is 0..=4.
                 let glyph = match self.status.network_signal.as_ref().map(|s| s.bars()) {
-                    Some(b) if b >= 3 => "\u{f1eb}",
-                    Some(2) => "\u{f1ec}",
-                    Some(1) => "\u{f1ed}",
-                    // Zero bars and no reading at all share the off glyph: on a
-                    // wired link there is no strength to report, and drawing the
-                    // empty-wifi glyph would claim the radio is failing.
-                    _ if self.status.network_ssid.is_empty() && !self.status.network_up => {
-                        "\u{f1ee}"
-                    }
-                    _ => "\u{f1eb}",
+                    Some(b) if b >= 3 => '\u{f1eb}',
+                    Some(2) => '\u{f1ec}',
+                    Some(1) => '\u{f1ed}',
+                    // No reading and no SSID is a wired link, not a failing
+                    // radio: drawing the empty-wifi glyph there would claim the
+                    // wireless is broken when it is simply not in use.
+                    _ if self.status.network_ssid.is_empty() && !self.status.network_up => '\u{eb2f}',
+                    _ => '\u{f1eb}',
                 };
-                // An SSID can be up to 32 bytes and the bar is a fixed height with a
-                // fixed budget. Elided rather than allowed to run into the
-                // volume glyph beside it.
-                let ssid = super::menu::truncate(&self.status.network_ssid, 18);
-                Some(cell(tile(
-                    glyph,
-                    (!ssid.is_empty()).then_some(ssid),
-                    t,
-                )))
+                let ssid = super::menu::truncate(&self.status.network_ssid, 16);
+                Some(cell(tile(glyph, (!ssid.is_empty()).then_some(ssid), t)))
             }
-            // Icon only. The percentage moves on every wheel tick, and a
-            // number that flickers while the user is not looking at it is
-            // worse than none. Mute is carried by the glyph instead.
             "volume" => self.status.volume.as_ref().map(|v| {
-                let glyph = if v.muted {
-                    "\u{f1e3}" // volume off
-                } else {
-                    "\u{f1e2}"
-                };
-                cell(tile(glyph, None, t))
+                let glyph = if v.muted { '\u{f026}' } else { '\u{f028}' };
+                cell(tile(glyph, Some(format!("{:>3}%", v.percent())), t))
             }),
             "battery" => {
-                // Nothing to draw on a desktop, and an empty pill would claim
-                // a battery that is not there.
+                // Nothing to draw on a desktop, and an empty pill would claim a
+                // battery that is not there.
                 if !self.status.battery.present {
                     return Vec::new();
                 }
-                Some(cell(battery_glyph(self.status.battery, t)))
+                let pct = self.status.battery.capacity.unwrap_or(0);
+                Some(cell(div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(battery_glyph(self.status.battery, t))
+                    .child(
+                        div()
+                            .text_size(px(services::theme::type_scale::WIDGET))
+                            .text_color(t.ink_a(1.0))
+                            .child(gpui::SharedString::from(format!("{pct}%"))),
+                    )
+                    .into_any_element()))
             }
+            _ if widget.ghost => Some(cell(ghost(widget.icon, t))),
             _ => None,
         }) else {
             return Vec::new();
@@ -725,6 +628,19 @@ impl BarView {
 
         vec![out]
     }
+}
+
+/// A widget with no data source yet: its icon, dimmed, and nothing else.
+///
+/// Dimming rather than hiding is the point — the slot is reserved at its final
+/// size so the bar does not reflow when the real widget lands, and a faint icon
+/// is honest about being a placeholder in a way an empty gap is not.
+fn ghost(icon: char, t: &crate::theme::Palette) -> gpui::AnyElement {
+    div()
+        .text_size(px(services::theme::type_scale::ICON))
+        .text_color(t.ink_a(0.3))
+        .child(gpui::SharedString::from(icon.to_string()))
+        .into_any_element()
 }
 
 /// The launcher mark at the head of the bar.
@@ -769,43 +685,30 @@ fn identity_mark(t: &crate::theme::Palette) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// A status readout: a tracked caption over a value, inside a hairline box.
+/// A status widget: an icon, optionally followed by a value.
 ///
-/// The box is what makes the bar look like instrumentation rather than like a
-/// row of numbers. It costs one border and it is the difference between the two.
-/// A status widget: a glyph, optionally followed by a value.
-///
-/// One line, no border, no caption. The previous two-line boxed tile put a
-/// tracked-out `NET` above a byte rate, which made the bar's status end look
-/// like a set of framed readouts rather than a single instrument — and the
-/// border drew a hairline around each one, so the widgets read as separate
-/// objects rather than as one group.
-///
-/// `value: None` renders the glyph alone. Volume is not worth text at a
-/// glance: the speaker glyph plus the mute state is the information, and a
-/// number that changes on every wheel tick is noise next to it.
-fn tile(
-    glyph: &'static str,
-    value: Option<String>,
-    t: &crate::theme::Palette,
-) -> gpui::AnyElement {
+/// Icon + value is the reference's shape for every bar widget, and it is why
+/// the bar reads as one instrument: an element with an icon has the same
+/// silhouette as its neighbours, so the eye groups them. The old version put a
+/// tracked-out caption above a number in a hairline box, which read as a set of
+/// framed readouts rather than as a status strip.
+fn tile(glyph: char, value: Option<String>, t: &crate::theme::Palette) -> gpui::AnyElement {
     let mut row = div()
         .flex()
         .items_center()
         .gap_1_5()
-        .h_full()
         .child(
             div()
-                .text_size(px(13.0))
+                .text_size(px(services::theme::type_scale::ICON))
                 .text_color(t.muted())
-                .child(gpui::SharedString::from(glyph)),
+                .child(gpui::SharedString::from(glyph.to_string())),
         );
 
     if let Some(value) = value {
         row = row.child(
             div()
-                .text_size(px(services::theme::type_scale::SMALL))
-                .text_color(t.ink_a(0.9))
+                .text_size(px(services::theme::type_scale::WIDGET))
+                .text_color(t.ink_a(1.0))
                 .child(gpui::SharedString::from(value)),
         );
     }

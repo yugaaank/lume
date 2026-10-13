@@ -25,6 +25,12 @@ pub enum Format {
     TimeWithSeconds,
     /// `Tue 14:32`
     WeekdayTime,
+    /// `Tue 13` — the reference's centre date label.
+    ///
+    /// Standalone weekday name plus day of month. The bar shows time and date
+    /// as two separate runs of text at different sizes, which is why this is
+    /// its own format rather than a flag on `Time`.
+    DateOnly,
 }
 
 impl Format {
@@ -53,6 +59,14 @@ impl Format {
                     .map(|c| c.to_ascii_uppercase())
                     .unwrap_or('?');
                 format!("{letter} {:02}:{:02}", at.hour(), at.minute())
+            }
+            Format::DateOnly => {
+                // The first three bytes of the full name: "Tuesday" -> "Tue".
+                // Same reason as the single letter: no translated table to keep
+                // in step with chrono's.
+                let name: String = at.weekday().to_string();
+                let abbrev: String = name.chars().take(3).collect();
+                format!("{abbrev} {}", at.day())
             }
         }
     }

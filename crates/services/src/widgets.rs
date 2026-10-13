@@ -81,6 +81,18 @@ pub struct WidgetDef {
     pub aliases: &'static [&'static str],
     /// Shown in settings.
     pub label: &'static str,
+    /// The Nerd Font codepoint this widget draws as its icon.
+    ///
+    /// Every widget is icon + value, which is what makes the bar read as one
+    /// instrument rather than as loose numbers. `'\0'` when the widget is drawn
+    /// rather than typed — the battery cell — or has no icon.
+    pub icon: char,
+    /// Renders a placeholder because lume has no data source for it yet.
+    ///
+    /// The bar shows these at their final size and position, so nothing moves
+    /// when they come alive. A ghost claims nothing about the system, which is
+    /// the honest state of a widget with no source behind it.
+    pub ghost: bool,
     /// A single decorative glyph. Not a translation and not a label — the
     /// reference uses one kanji per region, and it reads as an identity mark
     /// rather than as text. Empty when there is nothing honest to put here.
@@ -100,10 +112,28 @@ pub struct WidgetDef {
 /// from it, and an IPC verb will name from it — which is the point of having it
 /// at all.
 pub const REGISTRY: &[WidgetDef] = &[
+    // ---- left ----
+    WidgetDef {
+        key: "launcher",
+        aliases: &["arch"],
+        label: "Launcher",
+        // The Arch mark, which is what the reference shows. Drawn, not typed:
+        // a capital A would read as somebody's wordmark, not a distribution.
+        icon: '\u{e732}',
+        ghost: false,
+        // Its own plate. This is the first separator in the reference's
+        // `barSeps`, and it is what separates the launcher from the workspaces.
+        gloss: "",
+        side: Side::Left,
+        pad: 9.0,
+        popup: Some(PopupDef { id: "launcher", pages: &[] }),
+    },
     WidgetDef {
         key: "workspaces",
         aliases: &["workspace", "ws"],
         label: "Workspaces",
+        icon: '\0',
+        ghost: false,
         gloss: "",
         side: Side::Left,
         // The pip strip carries its own gaps, so it wants no extra padding.
@@ -113,49 +143,134 @@ pub const REGISTRY: &[WidgetDef] = &[
         popup: None,
     },
     WidgetDef {
-        key: "title",
-        aliases: &[],
-        label: "Session",
+        key: "notification",
+        aliases: &["notifications", "bell"],
+        label: "Notifications",
+        icon: '\u{f0f3}',
+        ghost: true,
         gloss: "",
         side: Side::Left,
-        pad: 4.0,
+        pad: 9.0,
+        popup: Some(PopupDef { id: "notification", pages: &[] }),
+    },
+    WidgetDef {
+        key: "cpu",
+        aliases: &["processor"],
+        label: "CPU",
+        icon: '\u{f4bc}',
+        ghost: true,
+        gloss: "",
+        side: Side::Left,
+        pad: 9.0,
+        popup: None,
+    },
+    WidgetDef {
+        key: "volume",
+        aliases: &["sound", "audio"],
+        label: "Volume",
+        icon: '\u{f028}',
+        ghost: false,
+        gloss: "",
+        side: Side::Left,
+        pad: 9.0,
+        popup: Some(PopupDef { id: "volume", pages: &[] }),
+    },
+
+    // ---- middle ----
+    WidgetDef {
+        key: "weather",
+        aliases: &[],
+        label: "Weather",
+        icon: '\u{e33d}',
+        ghost: true,
+        gloss: "",
+        side: Side::Middle,
+        pad: 9.0,
         popup: None,
     },
     WidgetDef {
         key: "clock",
         aliases: &[],
         label: "Clock",
+        icon: '\0',
+        ghost: false,
+        // The clock group is one plate and one click target: weather, time and
+        // date are one fact, not three.
         gloss: "",
         side: Side::Middle,
-        pad: 0.0,
+        pad: 9.0,
         popup: Some(PopupDef { id: "clock", pages: &[] }),
+    },
+
+    // ---- right ----
+    WidgetDef {
+        key: "media",
+        aliases: &["mpris", "music"],
+        label: "Media",
+        icon: '\u{f04b}',
+        ghost: true,
+        gloss: "",
+        side: Side::Right,
+        pad: 9.0,
+        popup: None,
     },
     WidgetDef {
         key: "network",
         aliases: &["wifi"],
         label: "Network",
+        icon: '\u{f1eb}',
+        ghost: false,
         gloss: "",
         side: Side::Right,
-        pad: 4.0,
+        pad: 9.0,
         popup: Some(PopupDef { id: "network", pages: &[] }),
-    },
-    WidgetDef {
-        key: "volume",
-        aliases: &["sound", "audio"],
-        label: "Volume",
-        gloss: "",
-        side: Side::Right,
-        pad: 4.0,
-        popup: Some(PopupDef { id: "volume", pages: &[] }),
     },
     WidgetDef {
         key: "battery",
         aliases: &["power"],
         label: "Battery",
+        // Drawn as a cell with a proportional fill, not this glyph — but the
+        // codepoint is the fallback for a machine that has a battery and no
+        // drawable cell.
+        icon: '\u{f240}',
+        ghost: false,
         gloss: "",
         side: Side::Right,
-        pad: 4.0,
+        pad: 9.0,
         popup: Some(PopupDef { id: "battery", pages: &[] }),
+    },
+    WidgetDef {
+        key: "brightness",
+        aliases: &["backlight"],
+        label: "Brightness",
+        icon: '\u{f185}',
+        ghost: true,
+        gloss: "",
+        side: Side::Right,
+        pad: 9.0,
+        popup: None,
+    },
+    WidgetDef {
+        key: "bluetooth",
+        aliases: &["bt"],
+        label: "Bluetooth",
+        icon: '\u{f293}',
+        ghost: true,
+        gloss: "",
+        side: Side::Right,
+        pad: 9.0,
+        popup: Some(PopupDef { id: "bluetooth", pages: &[] }),
+    },
+    WidgetDef {
+        key: "layout",
+        aliases: &["keyboard"],
+        label: "Keyboard layout",
+        icon: '\u{f11c}',
+        ghost: true,
+        gloss: "",
+        side: Side::Right,
+        pad: 9.0,
+        popup: None,
     },
 ];
 
@@ -276,17 +391,18 @@ mod tests {
     }
 
     /// Order within a region is the configured order, not the registry's.
+    ///
+    /// Volume is on the left, as the reference puts it, so this is no longer a
+    /// test about which region a widget lands in — only about order surviving
+    /// the split, which is the part that is easy to break.
     #[test]
     fn regions_keep_configured_order() {
         let names = vec!["network".into(), "clock".into(), "volume".into()];
         let (widgets, _) = resolve(&names);
         let (left, middle, right) = split_by_side(&widgets);
-        assert!(left.is_empty());
-        assert_eq!(middle.len(), 1);
-        assert_eq!(
-            right.iter().map(|w| w.key).collect::<Vec<_>>(),
-            ["network", "volume"]
-        );
+        assert_eq!(left.iter().map(|w| w.key).collect::<Vec<_>>(), ["volume"]);
+        assert_eq!(middle.iter().map(|w| w.key).collect::<Vec<_>>(), ["clock"]);
+        assert_eq!(right.iter().map(|w| w.key).collect::<Vec<_>>(), ["network"]);
     }
 
     /// Every popup id is unique, or two widgets can open the same panel and one

@@ -180,9 +180,18 @@ impl Default for Appearance {
 pub struct Bar {
     /// Which of the four bar geometries to draw.
     pub style: BarStyle,
-    /// Render order. The order in this vec is the order rendered — there is no
-    /// separate position field.
-    pub widgets: Vec<String>,
+    /// Widgets for the left sector, in render order.
+    ///
+    /// Placement lives here rather than in the registry because it is the
+    /// user's decision: a registry that decided which side each widget belongs
+    /// on could not put volume on the right, or the clock on the left, without
+    /// a code change. Three lists make every widget movable to every sector, and
+    /// each sector is drawn as one bubble, so moving one is visible immediately.
+    pub left: Vec<String>,
+    /// Widgets for the centre sector, in render order.
+    pub centre: Vec<String>,
+    /// Widgets for the right sector, in render order.
+    pub right: Vec<String>,
     pub height: f32,
     pub show_seconds: bool,
 }
@@ -256,12 +265,29 @@ impl Default for Bar {
     fn default() -> Self {
         Self {
             style: BarStyle::default(),
-            widgets: vec![
+            // Three sectors, each drawn as one bubble. Order within a list is
+            // render order.
+            //
+            // The ghosts are in the defaults on purpose — media, weather,
+            // brightness, bluetooth, layout, cpu and notification have no lume
+            // service yet, but leaving them out would mean the bar reflows every
+            // time one lands. A dimmed icon in its final slot is honest about
+            // being a placeholder and costs the layout nothing.
+            left: vec![
+                "launcher".into(),
                 "workspaces".into(),
-                "clock".into(),
-                "network".into(),
+                "notification".into(),
+                "cpu".into(),
                 "volume".into(),
+            ],
+            centre: vec!["weather".into(), "clock".into()],
+            right: vec![
+                "media".into(),
+                "network".into(),
                 "battery".into(),
+                "brightness".into(),
+                "bluetooth".into(),
+                "layout".into(),
             ],
             // 40, not 32. The bar carries a caption line under each status
             // value — the reference's tile look — and 32 cannot hold two rows
@@ -541,7 +567,7 @@ mod tests {
         let text = r#"
 [bar]
 height = 40.0
-widgets = ["clock"]
+right = ["clock"]
 future_option = true
 
 [appearance]
@@ -550,13 +576,30 @@ mode = "Light"
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.bar.height, 40.0);
         assert_eq!(cfg.appearance.mode, "Light");
-        assert_eq!(cfg.bar.widgets, vec!["clock".to_string()]);
+        assert_eq!(cfg.bar.right, vec!["clock".to_string()]);
+    }
+
+    /// A widget's sector is the list it is named in, so the same widget can sit
+    /// in any of the three. This is the property that makes the bar rearrangeable
+    /// without a code change, so it is worth pinning: a regression that moved
+    /// placement back into the registry would still leave these tests green.
+    #[test]
+    fn a_widget_can_be_named_in_any_sector() {
+        let cfg: Config = toml::from_str(
+            "[bar]\nleft = [\"battery\"]\ncentre = [\"battery\"]\nright = [\"battery\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.bar.left, vec!["battery".to_string()]);
+        assert_eq!(cfg.bar.centre, vec!["battery".to_string()]);
+        assert_eq!(cfg.bar.right, vec!["battery".to_string()]);
     }
 
     #[test]
     fn missing_keys_use_defaults() {
         let cfg: Config = toml::from_str("[bar]\nheight = 40.0\n").unwrap();
         assert_eq!(cfg.bar.height, 40.0);
-        assert_eq!(cfg.bar.widgets, Bar::default().widgets);
+        assert_eq!(cfg.bar.left, Bar::default().left);
+        assert_eq!(cfg.bar.centre, Bar::default().centre);
+        assert_eq!(cfg.bar.right, Bar::default().right);
     }
 }

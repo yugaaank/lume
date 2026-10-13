@@ -161,6 +161,13 @@ pub mod alpha {
     /// blur, which the bar does not use. The reference bar is solid black.
     pub const SURFACE: f32 = 0.985;
 
+    /// The island pill's fill — the reference's `barBg`: paper at 0.94.
+    ///
+    /// Separate from `SURFACE` because the pill is meant to read as a soft
+    /// plate floating over the wallpaper, while a fullscreen surface must be
+    /// opaque to stop window text bleeding through it.
+    pub const PILL: f32 = 0.94;
+
 }
 
 /// Corner radii.
@@ -202,8 +209,15 @@ pub mod type_scale {
     /// Captions. The reference's tracked micro labels: section headers,
     /// region names, the marks inside the identity box.
     pub const TINY: f32 = 8.0;
-    /// The clock.
-    pub const CLOCK: f32 = 18.0;
+    /// Bar status values. The reference's widget labels: a row of icon + 12px
+    /// mono text inside a 28px-tall pill.
+    pub const WIDGET: f32 = 12.0;
+    /// Icon glyphs in a bar widget. The reference draws most at 13–15px with
+    /// the label beside them; one size reads as one icon set.
+    pub const ICON: f32 = 14.0;
+    /// The clock. Small, like every other bar label — the reference's is 12px
+    /// mono, not display type. A large clock was lume's own invention.
+    pub const CLOCK: f32 = 12.0;
     /// Display type.
     pub const DISPLAY: f32 = 44.0;
 

@@ -48,6 +48,26 @@ const FACES: &[&str] = &[
     "JetBrainsMonoNerdFont-Italic.ttf",
 ];
 
+/// Directories searched for the CJK face, which is a `.ttc` collection rather
+/// than a `.ttf` in the same place.
+const CJK_SEARCH: &[&str] = &[
+    "/usr/share/fonts/noto-cjk",
+    "/usr/share/fonts/truetype/noto",
+];
+
+/// The CJK face, for the workspace kanji numerals.
+///
+/// A separate font, and the reason is glyph coverage rather than taste: the
+/// kanji numerals 一二三四五 are U+4E00 and up, and no Latin mono has them. The
+/// reference draws its workspace cells in Noto Sans CJK for exactly this
+/// reason. Without this face the numerals render as tofu — the one place the
+/// workspace strip cannot fall back to a similar-looking glyph, because there
+/// is no similar-looking glyph to fall back to.
+const CJK_FACE: &str = "NotoSansCJK-Regular.ttc";
+
+/// The CJK family name, as the face reports it (name ID 1).
+pub const CJK_FAMILY: &str = "Noto Sans CJK JP";
+
 /// Load the faces into the text system.
 ///
 /// Returns how many were registered. Zero is not fatal — the shell renders in a
@@ -77,8 +97,26 @@ pub fn load(cx: &gpui::App) -> usize {
         return 0;
     }
 
+    let count = FACES.len();
+    if let Some(path) = find_in(CJK_SEARCH, CJK_FACE) {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                if let Err(e) = cx.text_system().add_fonts(vec![Cow::Borrowed(
+                    Box::leak(bytes.into_boxed_slice()),
+                )]) {
+                    tracing::warn!(path = %path.display(), "could not register CJK face: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!(path = %path.display(), "could not read CJK face: {e}"),
+        }
+    } else {
+        // Not fatal: only the workspace numerals need it, and they degrade to
+        // digits rather than to a shell that will not start.
+        tracing::debug!("no CJK face installed; workspace numerals will fall back to digits");
+    }
+
     match cx.text_system().add_fonts(fonts) {
-        Ok(()) => FACES.len(),
+        Ok(()) => count,
         Err(e) => {
             tracing::error!("could not register fonts: {e:#}");
             0
@@ -87,8 +125,11 @@ pub fn load(cx: &gpui::App) -> usize {
 }
 
 fn find(name: &str) -> Option<PathBuf> {
-    SEARCH
-        .iter()
+    find_in(SEARCH, name)
+}
+
+fn find_in(dirs: &[&str], name: &str) -> Option<PathBuf> {
+    dirs.iter()
         .map(|dir| Path::new(dir).join(name))
         .find(|p| p.is_file())
 }

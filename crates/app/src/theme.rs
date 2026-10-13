@@ -78,6 +78,18 @@ impl Palette {
         self.ink_a(theme::alpha::LINE_SOFT)
     }
 
+    /// The island pill's border: ink mixed 22% into paper, fully opaque.
+    ///
+    /// Not `line()`, which is ink at an alpha. Over a near-opaque pill that is
+    /// already lighter than the desktop, a translucent border reads as a smear;
+    /// mixing produces the same visual weight as an opaque hairline and stays
+    /// opaque when the wallpaper underneath changes. The reference's
+    /// `v2BarBorder`, and the same reason it is defined as a mix there.
+    pub fn pill_border(&self) -> Rgba {
+        let m = 0.22;
+        mix(self.paper, self.ink, m)
+    }
+
     pub fn line_strong(&self) -> Rgba {
         self.ink_a(theme::alpha::LINE_STRONG)
     }
@@ -132,4 +144,19 @@ fn rgba(c: (f32, f32, f32, f32)) -> Rgba {
 /// already-faded colours.
 fn faded(c: Rgba, alpha: f32) -> Rgba {
     Rgba::from((c.red, c.green, c.blue, alpha.clamp(0.0, 1.0)))
+}
+
+/// Blend `b` into `a` by `t`, opaque.
+///
+/// Per-channel rather than an alpha composite, so `a` must be opaque. Used for
+/// the one rule that is a colour in its own right — the pill border — rather
+/// than "the ink, quieter", which is what every other rule in the bar is.
+fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
+    let t = t.clamp(0.0, 1.0);
+    Rgba::from((
+        a.red + (b.red - a.red) * t,
+        a.green + (b.green - a.green) * t,
+        a.blue + (b.blue - a.blue) * t,
+        1.0,
+    ))
 }
