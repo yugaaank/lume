@@ -87,6 +87,19 @@ pub enum CompositorEvent {
 /// $XDG_RUNTIME_DIR/hypr/, with the event stream at `.socket2.sock` inside it.
 /// Older versions put a flat `.socket2.sock` directly under hypr/. Probe both;
 /// do not guess.
+/// Where Hyprland's *request* socket lives, same probing as the event socket.
+///
+/// A separate socket from `.socket2.sock`: that one only pushes events, this one
+/// answers commands. The cursor comes from here rather than from `hyprctl`,
+/// because a process spawn per frame of pointer tracking is not a cost anyone
+/// should sign up for.
+pub fn hypr_request_socket_paths() -> Vec<PathBuf> {
+    hypr_socket_paths()
+        .into_iter()
+        .map(|p| p.with_file_name(".socket.sock"))
+        .collect()
+}
+
 pub fn hypr_socket_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
 
@@ -115,6 +128,26 @@ pub trait Compositor: Send + Sync {
 
     /// Read the focused workspace.
     fn active_workspace(&self) -> anyhow::Result<Workspace>;
+
+    /// The output the shell is driving, in pixels.
+    ///
+    /// The pointer is reported in screen coordinates, and a surface knows only
+    /// its own size — not where it sits on the screen. So converting "the
+    /// pointer is over this band" into arithmetic needs the output height, and
+    /// that has to come from the compositor.
+    fn output_size(&self) -> (f32, f32) {
+        (1920.0, 1080.0)
+    }
+
+    /// Where the pointer is, in screen coordinates.
+    ///
+    /// Not `Option` and not a Result-in-the-signature: a shell with no idea
+    /// where the pointer is has to behave as though it is nowhere, and every
+    /// caller would unwrap or match. `Err` means "the compositor would not say",
+    /// which the dock treats the same as not knowing.
+    fn cursor(&self) -> anyhow::Result<(f32, f32)> {
+        anyhow::bail!("no cursor query on this compositor")
+    }
 
     /// Read the open windows.
     ///

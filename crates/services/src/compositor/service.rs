@@ -33,11 +33,30 @@ use super::{Client, Compositor, Workspace, hyprland};
 /// compositor restart.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often the pointer is re-read.
+///
+/// 50ms is the floor at which a dock feels attached to the cursor rather than
+/// following it. The read is a write and a line read on a socket that is
+/// already open, so the cost is not the reason this number is 20Hz — the cost
+/// of `hyprctl` per tick is.
+///
+/// This loop runs unconditionally rather than only while something wants it.
+/// The alternative is a watch/demand signal with exactly one consumer, which is
+/// an extension point built before there is a second thing to switch it on for.
+/// If it ever shows up in a profile, arm it then.
+const CURSOR_INTERVAL: Duration = Duration::from_millis(50);
+
 pub struct CompositorService {
     inner: Arc<dyn Compositor>,
     workspaces: Arc<ArcSwap<Vec<Workspace>>>,
     active: Arc<ArcSwap<Workspace>>,
     clients: Arc<ArcSwap<Vec<Client>>>,
+    /// Screen coordinates of the pointer. `None` until the first read, and
+    /// after any failure — which the dock treats as "the pointer is nowhere",
+    /// so a compositor that will not answer leaves the dock hidden rather than
+    /// stuck open.
+    cursor: Arc<ArcSwap<Option<(f32, f32)>>>,
+    output: (f32, f32),
     changed: Arc<Notify>,
 }
 
@@ -64,6 +83,11 @@ impl CompositorService {
         // constructor's job is to be able to answer immediately, and clients is
         // the one thing the dock can render sensibly without.
         let clients = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let cursor = Arc::new(ArcSwap::from_pointee(None));
+        // Read once. The shell does not follow a monitor being unplugged, and a
+        // per-frame query to learn a number that cannot change would be a
+        // `hyprctl` spawn on the render path.
+        let output = inner.output_size();
         let changed = Arc::new(Notify::new());
 
         // Log before spawning, while the originals are still intact. Every
@@ -71,10 +95,13 @@ impl CompositorService {
         tracing::info!(
             workspaces = workspaces.load().len(),
             frame = ?inner.frame_duration(),
+            ?output,
             "compositor service up"
         );
 
-        let state = Self { inner, workspaces, active, clients, changed };
+        let state = Self { inner, workspaces, active, clients, cursor, output, changed };
+
+        spawn_cursor_loop(handle.clone(), state.inner.clone(), state.cursor.clone());
 
         spawn_poll_loop(
             handle.clone(),
@@ -103,6 +130,16 @@ impl CompositorService {
 
     pub fn active(&self) -> Arc<Workspace> {
         self.active.load_full()
+    }
+
+    /// Where the pointer is, in screen coordinates.
+    ///
+    /// Cheap: an atomic pointer load, so it is safe from render. Read from
+    /// Hyprland's request socket rather than from `window.mouse_position()`,
+    /// because a layer surface that Hyprland is not targeting never gets a
+    /// motion event, and the shell's dock surface is one. See progress/DOCK.md.
+    pub fn cursor(&self) -> Option<(f32, f32)> {
+        **self.cursor.load()
     }
 
     /// The open windows, newest read last.
@@ -151,6 +188,11 @@ impl CompositorService {
         self.changed.clone()
     }
 
+    /// The driven output's size, in pixels. Read once at startup.
+    pub fn output_size(&self) -> (f32, f32) {
+        self.output
+    }
+
     pub fn frame_duration(&self) -> Duration {
         self.inner.frame_duration()
     }
@@ -186,6 +228,40 @@ impl CompositorService {
     pub fn act(&self, action: super::Action) -> anyhow::Result<()> {
         self.inner.act(action)
     }
+}
+
+fn spawn_cursor_loop(
+    handle: tokio::runtime::Handle,
+    compositor: Arc<dyn Compositor>,
+    cursor: Arc<ArcSwap<Option<(f32, f32)>>>,
+) {
+    handle.spawn(async move {
+        // A failure is logged at most once a second rather than every tick.
+        // 20 identical errors a second is noise that hides the one that matters.
+        let mut last_error = std::time::Instant::now() - Duration::from_secs(1);
+        loop {
+            match compositor.cursor() {
+                Ok(at) => {
+                    if **cursor.load() != Some(at) {
+                        cursor.store(Arc::new(Some(at)));
+                    }
+                }
+                Err(e) => {
+                    // Drop to unknown rather than keeping the last position: a
+                    // stale coordinate is worse than none, because it looks
+                    // current.
+                    if cursor.load().is_some() {
+                        cursor.store(Arc::new(None));
+                    }
+                    if last_error.elapsed() >= Duration::from_secs(1) {
+                        tracing::debug!("cursor read failed: {e:#}");
+                        last_error = std::time::Instant::now();
+                    }
+                }
+            }
+            tokio::time::sleep(CURSOR_INTERVAL).await;
+        }
+    });
 }
 
 fn spawn_poll_loop(
@@ -260,12 +336,19 @@ fn spawn_event_loop(
                         let workspaces = workspaces.clone();
                         let active = active.clone();
                         let changed = changed.clone();
+                        let clients = clients.clone();
                         async move {
                             if let Ok(list) = hyprland::Hyprland.workspaces() {
                                 workspaces.store(Arc::new(list));
                             }
                             if let Ok(current) = hyprland::Hyprland.active_workspace() {
                                 active.store(Arc::new(current));
+                            }
+                            // Clients too. Left out, the dock's running list
+                            // only ever updates on the 5 s poll, so opening a
+                            // window is acknowledged up to five seconds late.
+                            if let Ok(list) = hyprland::Hyprland.clients() {
+                                clients.store(Arc::new(list));
                             }
                             changed.notify_one();
                         }

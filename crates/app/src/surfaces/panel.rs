@@ -232,26 +232,35 @@ impl Render for Dock {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity();
 
-        // Where the pointer is, read once per render. The surface's timer
-        // supplies the renders; this supplies the answer.
+        // Where the pointer is, from the compositor — not from this window.
         //
-        // "Inside" is geometric rather than an event: the pointer is over the
-        // dock when it is anywhere in this surface, which is a band at the
-        // screen edge. That has an off as well as an on, which the earlier
-        // `hovered.is_some()` version did not — hover was only ever set, never
-        // cleared, so the dock latched open the first time a tile was touched.
-        let pos = window.mouse_position();
-        let vp = window.viewport_size();
-        let inside = pos.x >= px(0.0)
-            && pos.y >= px(0.0)
-            && pos.x < vp.width
-            && pos.y < vp.height;
+        // `window.mouse_position()` is the obvious thing and it does not work
+        // here: it is only ever written by a pointer event this surface
+        // receives, and Hyprland does not reliably send one to this surface. It
+        // measured frozen at x=1212, y=-498 while the cursor sat elsewhere,
+        // whatever the input region was. The compositor knows where the pointer
+        // is regardless of who is asking, so it is asked.
+        //
+        // The answer is screen coordinates, and this surface is a band at the
+        // bottom of the screen, so "on the dock" is a screen-space rectangle:
+        // the tiles' footprint, or the trigger strip at the very bottom. That is
+        // Ryoku's mask — band rect ∪ peek strip — expressed in the space the
+        // pointer is actually reported in.
+        let state = cx.global::<services::AppState>();
+        let (out_w, out_h) = state.compositor.output_size();
+        let tiles = self.tiles_bounds(px(out_w), px(DOCK_HEIGHT));
+        let pointer = state.compositor.cursor();
+        let inside = pointer.is_some_and(|(x, y)| {
+            y >= out_h - self.trigger_px()
+                || (y >= out_h - DOCK_HEIGHT
+                    && x >= f32::from(tiles.origin.x)
+                    && x <= f32::from(tiles.right()))
+        });
+
         if !inside && self.hovered.is_some() {
             self.hovered = None;
         }
-        let in_trigger = pos.y >= vp.height - px(self.trigger_px());
-        tracing::debug!(x = f32::from(pos.x), y = f32::from(pos.y), inside, "DBG pos");
-        self.set_pointer(in_trigger || inside, cx);
+        self.set_pointer(inside || self.hovered.is_some(), cx);
 
         let t = crate::theme::current(cx);
 

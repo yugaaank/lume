@@ -3,13 +3,13 @@
 //! Talks to `hyprctl` for queries and to the event socket for change
 //! notification. Verified against 0.56.2.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 
-use super::{Action, Client, Compositor, Workspace, hypr_socket_paths};
+use super::{Action, Client, Compositor, Workspace, hypr_request_socket_paths, hypr_socket_paths};
 /// IPC calls get their own short timeout so a wedged Hyprland cannot hang the
 /// UI's poll loop.
 const IPC_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -55,6 +55,96 @@ fn query(args: &[&str]) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The reply to `j/cursorpos`. One JSON object, one line.
+#[derive(serde::Deserialize)]
+struct RawCursor {
+    x: f32,
+    y: f32,
+}
+
+/// One request to Hyprland's request socket.
+///
+/// Connect, write one command, read the reply, close. It *looks* like a stream
+/// and is not: Hyprland closes the connection once it has answered, so holding
+/// it open gets a broken pipe on the second write. Measured, not assumed.
+///
+/// Still much cheaper than `hyprctl`: no fork, no exec, no dynamic linking, no
+/// re-parse of a whole compositor dump — a connect, a dozen bytes, a reply. At
+/// the 20Hz the dock reads the pointer, this is free.
+fn request(command: &str) -> anyhow::Result<String> {
+    let mut last: Option<std::io::Error> = None;
+    for path in hypr_request_socket_paths() {
+        let mut stream = match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                last = Some(e);
+                continue;
+            }
+        };
+
+        // The reply is a couple of hundred bytes. A read that takes longer than
+        // this is a wedged compositor rather than a slow one, and bounding it
+        // keeps the poll cadence a property of the loop, not of the compositor.
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+
+        if let Err(e) = stream.write_all(command.as_bytes()).and_then(|_| stream.write_all(b"\n")) {
+            last = Some(e);
+            continue;
+        }
+        let _ = stream.flush();
+
+        return match read_reply(&mut stream) {
+            Ok(body) => Ok(body),
+            Err(e) => Err(anyhow!("hyprland request {command:?} failed: {e}")),
+        };
+    }
+    Err(anyhow!(
+        "no hyprland request socket: {}",
+        last.map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
+/// Read one reply, to its closing brace.
+///
+/// The server closes after answering, but reading to EOF is not the terminator
+/// to rely on: a reply is pretty-printed across several lines, so the first
+/// `read_line` is not the answer. A leading blank line is also normal on the
+/// batch form. Stop at the closing brace instead — that is the end of the
+/// document, and anything after it belongs to nobody.
+fn read_reply(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut buf = String::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                if buf.trim_end().ends_with('}') {
+                    break;
+                }
+            }
+            // A timeout here just means the reply was short and is already in
+            // the buffer. Whatever arrived is still the answer.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(buf)
+}
+
+/// Pull the JSON document out of a raw reply.
+///
+/// A batch reply is `\n{ ... }\n`, so neither end of the socket buffer is the
+/// start of the answer. Cutting at the first brace and the last one is blunt and
+/// exact: a reply holds exactly one document.
+fn json_body(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    (end > start).then(|| &raw[start..=end])
 }
 
 fn query_json<T: serde::de::DeserializeOwned>(args: &[&str]) -> anyhow::Result<T> {
@@ -129,6 +219,10 @@ struct RawMonitor {
     name: String,
     #[serde(default)]
     refreshrate: f64,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
 }
 
 /// Wire clients into the model: drop the ungroupable, mark the focused one,
@@ -180,6 +274,20 @@ impl Compositor for Hyprland {
             .any(RawClient::is_tiled))
     }
 
+    fn cursor(&self) -> anyhow::Result<(f32, f32)> {
+        // The [[BATCH]] prefix is not decoration. Hyprland 0.56's socket looks
+        // commands up in a request table, and `cursorpos` is not in it: bare
+        // `cursorpos`, `j/cursorpos` and `/j/cursorpos` all answer "unknown
+        // request", while the batch form evaluates it and replies. Verified on
+        // the running compositor, not read off a wiki.
+        let reply = request("[[BATCH]]j/cursorpos")?;
+        let body = json_body(&reply)
+            .with_context(|| format!("no JSON in cursorpos reply: {reply:?}"))?;
+        let raw: RawCursor =
+            serde_json::from_str(body).with_context(|| format!("bad cursorpos reply: {reply:?}"))?;
+        Ok((raw.x, raw.y))
+    }
+
     fn clients(&self) -> anyhow::Result<Vec<Client>> {
         let raw: Vec<RawClient> = query_json(&["-j", "clients"])?;
 
@@ -193,6 +301,22 @@ impl Compositor for Hyprland {
             .unwrap_or_default();
 
         Ok(to_clients(raw, &active))
+    }
+
+    fn output_size(&self) -> (f32, f32) {
+        // The first output with a real size. Monitors can report 0x0 while a
+        // hotplug is in flight, and a dock sized against that is invisible.
+        match query_json::<Vec<RawMonitor>>(&["-j", "monitors"]) {
+            Ok(monitors) => monitors
+                .iter()
+                .find(|m| m.width > 0 && m.height > 0)
+                .map(|m| (m.width as f32, m.height as f32))
+                .unwrap_or((1920.0, 1080.0)),
+            Err(e) => {
+                tracing::debug!("could not read output size: {e:#}");
+                (1920.0, 1080.0)
+            }
+        }
     }
 
     fn refresh_rate(&self) -> f64 {
@@ -294,6 +418,39 @@ mod tests {
             windows: 2
         }
         .is_special());
+    }
+
+    /// The exact bytes a batch reply arrives as, captured from the running
+    /// compositor: a leading newline, pretty-printed JSON, a trailing newline.
+    #[test]
+    fn extracts_json_from_a_batch_reply() {
+        let raw = "\n{\n    \"x\": 1121,\n    \"y\": 788\n}\n";
+        let body = json_body(raw).unwrap();
+        let c: RawCursor = serde_json::from_str(body).unwrap();
+        assert_eq!((c.x, c.y), (1121.0, 788.0));
+    }
+
+    #[test]
+    fn a_reply_with_no_json_yields_nothing() {
+        assert_eq!(json_body("unknown request"), None);
+        assert_eq!(json_body(""), None);
+    }
+
+    /// The cursor reply is one JSON object on one line. Guarding the shape
+    /// matters because a parse failure here looks like a frozen dock, not like
+    /// a bad reply.
+    #[test]
+    fn parses_cursorpos_reply() {
+        let raw: RawCursor = serde_json::from_str(r#"{"x":582,"y":746}"#).unwrap();
+        assert_eq!((raw.x, raw.y), (582.0, 746.0));
+    }
+
+    #[test]
+    fn fractional_cursor_is_accepted() {
+        // Scaled outputs report fractional coordinates. Truncating them would
+        // leave the reveal edge a pixel out on a HiDPI screen.
+        let raw: RawCursor = serde_json::from_str(r#"{"x":582.5,"y":746.25}"#).unwrap();
+        assert!((raw.x - 582.5).abs() < f32::EPSILON);
     }
 
     fn raw(address: &str, class: &str, ws: &str) -> RawClient {
