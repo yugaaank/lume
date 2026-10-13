@@ -175,12 +175,68 @@ impl MenuId {
         match self {
             MenuId::Volume => volume_menu(),
             MenuId::Network => network_menu(),
+            MenuId::Battery => battery_menu(),
             other => Menu {
                 title: other.title(),
                 items: vec![Item::Hint("nothing to configure yet".into())],
             },
         }
     }
+}
+
+fn battery_menu() -> Menu {
+    let d = services::battery::BatteryDetail::read();
+
+    if !d.battery.present {
+        return Menu {
+            title: "Battery",
+            items: vec![Item::Hint("no battery detected".into())],
+        };
+    }
+
+    let pct = d.battery.capacity.unwrap_or(0);
+    let mut items = vec![Item::Meter {
+        value: pct as f32 / 100.0,
+        caption: format!("{pct}%"),
+    }];
+
+    // Every row below is conditional. The kernel publishes different subsets
+    // of these on different machines, and a row showing a hardcoded zero is
+    // worse than no row: it reads as data the panel made up.
+    let mut detail = |label: &'static str, value: String| {
+        items.push(Item::Detail { label, value });
+    };
+
+    detail("Status", d.status_title());
+
+    if let Some(text) = d.time_text() {
+        detail(d.time_label(), text);
+    }
+
+    if let Some(health) = d.health {
+        detail("Health", format!("{health}%"));
+    }
+
+    if let Some(watts) = d.rate_w {
+        detail("Power draw", format!("{watts} W"));
+    }
+
+    if let Some(wh) = d.size_wh {
+        detail("Battery size", format!("{wh} Wh"));
+    }
+
+    // Zero means the kernel has no cycle count yet, not that the pack is
+    // unused. Showing "0" would read as a brand-new battery.
+    match d.cycles {
+        Some(c) if c > 0 => detail("Charge cycles", c.to_string()),
+        _ => {}
+    }
+
+    if items.len() == 2 {
+        items.push(Item::Hint("the kernel exposes no further detail".into()));
+    }
+
+    Menu { title: "Battery", items }
 }
 
 fn volume_menu() -> Menu {
@@ -342,6 +398,41 @@ fn network_menu() -> Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole panel rests on this: a row the kernel cannot fill must be
+    /// absent, not present-and-zero. A hardcoded 0% health reads as data.
+    #[test]
+    fn the_battery_menu_only_shows_what_the_kernel_publishes() {
+        let menu = MenuId::Battery.build();
+
+        // The assertions below describe a populated pack. On a desktop the
+        // panel correctly says so instead, and there is nothing to check.
+        if !services::battery::BatteryDetail::read().battery.present {
+            assert!(menu.items.iter().any(|i| matches!(i, Item::Hint(_))));
+            return;
+        }
+
+        let labels: Vec<&str> = menu
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Detail { label, .. } => Some(*label),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(labels.first(), Some(&"Status"));
+        // Whatever this machine is, no value may be a placeholder.
+        for item in &menu.items {
+            if let Item::Detail { label, value } = item {
+                assert!(!value.trim().is_empty(), "{label} has a blank value");
+                assert_ne!(value.trim(), "-", "{label} has a placeholder value");
+            }
+        }
+        // A cycle count of 0 means the kernel has no count yet. This pack
+        // reports `cycle_count = 0`, so the row must be gone, not "0".
+        assert!(!labels.contains(&"Charge cycles"));
+    }
 
     #[test]
     fn menu_names_parse() {
