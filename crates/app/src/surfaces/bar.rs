@@ -423,7 +423,12 @@ fn pill(children: Vec<gpui::AnyElement>, t: &crate::theme::Palette, height: f32)
     div()
         .flex()
         .items_center()
-        .h(px(height))
+        // Padding so the widgets (and their own margins) are never flush
+        // with the bubble's edge — the background plate keeps its own space.
+        .px(px(8.0))
+        // Shorter than the bar so the pill has breathing room top and bottom,
+        // instead of hugging the surface edge.
+        .h(px(height - 6.0))
         // A real gap between cells, on top of each cell's own margin. The
         // margin alone is the cell's padding and a widget's content sits inside
         // it; without the gap a wide value's margin is the only thing separating
