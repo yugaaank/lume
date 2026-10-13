@@ -377,7 +377,7 @@ impl Render for BarView {
             // The reference's `shellOuterMargin`: pills are held off the screen
             // edges by 5px. Without it the outer pills sit flush against x=0
             // and their rounded corners and shadow are clipped.
-            .px(px(8.0))
+            .px(px(12.0))
             .flex()
             .items_center()
             .gap_3()
