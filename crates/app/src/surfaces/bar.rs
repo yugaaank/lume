@@ -328,11 +328,14 @@ impl Render for BarView {
         // middle region genuinely centred at any content width, which is the
         // entire reason it is its own region.
         //
-        // Those equal columns are also where the two zone rules go. Because the
-        // columns are exactly one third each, a border on the left edge of the
-        // middle and right columns lands at 1/3 and 2/3 of the bar, and stays
-        // there however wide the content is. The reference's ruled "system
-        // dossier" look comes from these two hairlines and nothing else.
+        // The two zone rules are the left borders of the middle and right
+        // columns. Because the columns are equal they land at a third and two
+        // thirds — measured at 647 and 1284 on a 1920px bar, so within half a
+        // percent, the residue being the inter-column gap the thirds are taken
+        // from. "Exactly a third" would be the wrong word; "a third, give or
+        // take the gaps" is what it is.
+        //
+        // They were described here for a while before anything drew them.
         // Each zone is a *card*: a hairline box with a tracked caption on its
         // left edge and the widgets inside it. Three bordered boxes on one
         // black band read as instrumentation; the same widgets loose on the
@@ -353,7 +356,8 @@ impl Render for BarView {
             .flex()
             .items_center()
             .gap_3()
-            .px_3()
+            // No horizontal padding here; the two outer zones carry it, so the
+            // strip's content box is the full bar width.
             .bg(t.paper_a(services::theme::alpha::SURFACE))
             .text_color(t.ink_a(1.0))
             .font_family(services::theme::type_scale::FAMILY)
@@ -375,6 +379,7 @@ impl Render for BarView {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .pl_3()
                     .child(
                         div()
                             .id("lume-bar-mark")
@@ -410,6 +415,10 @@ impl Render for BarView {
                     ),
             )
             // Centre: the clock, boxed so it reads as the primary instrument.
+            //
+            // The left border is the rule at 1/3. It lands there because the
+            // columns are equal, which is the one thing the layout is for — the
+            // comment above says so, and until now nothing drew it.
             .child(
                 div()
                     .flex_1()
@@ -417,9 +426,11 @@ impl Render for BarView {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .border_l_1()
+                    .border_color(t.line())
                     .children(middle.iter().flat_map(|w| self.render_widget(w, &t))),
             )
-            // Status.
+            // Status. Its left border is the rule at 2/3.
             .child(
                 div()
                     .flex_1()
@@ -427,6 +438,9 @@ impl Render for BarView {
                     .flex()
                     .items_center()
                     .justify_end()
+                    .border_l_1()
+                    .border_color(t.line())
+                    .pr_3()
                     .gap_2()
                     .children(right.iter().flat_map(|w| self.render_widget(w, &t))),
             ),
