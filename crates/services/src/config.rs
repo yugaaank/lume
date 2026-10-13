@@ -187,21 +187,35 @@ pub struct Bar {
     pub show_seconds: bool,
 }
 
-/// The four bar geometries.
+/// The bar geometries.
 ///
-/// These differ in *geometry*, not decoration: `Single` is one full-width
-/// surface, `Bubbles` is a row of separate rounded islands with no full-width
-/// bar behind them, `Islands` anchors clusters to different screen edges rather
-/// than laying out in one row, and `Framed` is a centred strip with the
-/// workspace pips cut out as a notch. Each reserves a different amount of
-/// screen, so switching one recomputes the layer surface's exclusive zone.
+/// These differ in *shape*, not in implementation: one renderer reads the style
+/// and draws the shell accordingly. That is the whole point of the enum being
+/// here rather than a match that picks a different bar.
+///
+/// - `Single` — one surface spanning the output, square wherever it sits flush
+///   against a screen edge.
+/// - `Bubbles` — a content-width shell with no surface behind it; each region is
+///   its own rounded plate.
+/// - `Framed` — a content-width shell, fully rounded, with the clock cut out as
+///   a notch.
+///
+/// **`Islands` was removed.** Its own description was "anchors clusters to
+/// different screen edges rather than laying out in one row", which is the
+/// four-edge frame — a different surface model, not a different shape. It was
+/// listed here anyway, with `implemented()` returning false so that picking it
+/// quietly drew something else. A style that silently draws as another style is
+/// worse than one that is not offered, and the honest move was to stop offering
+/// it. Ryoku's per-region plates are `Bubbles` here.
+///
+/// Every style reserves `bar.height` on one edge, so switching between them
+/// changes nothing the compositor needs to be told about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum BarStyle {
     #[default]
     Single,
     Bubbles,
-    Islands,
     Framed,
 }
 
@@ -210,7 +224,6 @@ impl BarStyle {
         match self {
             BarStyle::Single => "single",
             BarStyle::Bubbles => "bubbles",
-            BarStyle::Islands => "islands",
             BarStyle::Framed => "framed",
         }
     }
@@ -220,40 +233,23 @@ impl BarStyle {
         match self {
             BarStyle::Single => "Single bar",
             BarStyle::Bubbles => "Bubbles",
-            BarStyle::Islands => "Edge islands",
             BarStyle::Framed => "Framed centre",
         }
     }
 
     pub fn all() -> &'static [BarStyle] {
-        &[
-            BarStyle::Single,
-            BarStyle::Bubbles,
-            BarStyle::Islands,
-            BarStyle::Framed,
-        ]
+        &[BarStyle::Single, BarStyle::Bubbles, BarStyle::Framed]
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "single" | "bar" => Some(BarStyle::Single),
             "bubbles" | "bubble" => Some(BarStyle::Bubbles),
-            "islands" | "island" | "edges" => Some(BarStyle::Islands),
             "framed" | "frame" => Some(BarStyle::Framed),
             _ => None,
         }
     }
 
-    /// Implemented, or not yet.
-    ///
-    /// Only `Single` is drawn today. The other three are real config values so
-    /// the settings picker can offer them, but rendering one falls back to
-    /// `Single` **and logs**, rather than quietly drawing the wrong thing —
-    /// a style that silently renders as another is worse than one that is not
-    /// offered yet.
-    pub fn implemented(self) -> bool {
-        matches!(self, BarStyle::Single)
-    }
 }
 
 impl Default for Bar {
