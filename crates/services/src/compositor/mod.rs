@@ -37,6 +37,33 @@ impl Workspace {
     }
 }
 
+/// One open window.
+///
+/// This is what the dock groups by. Without it a dock can only show pins, so it
+/// is a launcher with extra steps — running apps have no representation and
+/// "which window do I click" has no answer.
+///
+/// `class` is the compositor's window class, *not* a `.desktop` id. Ryoku keys
+/// the whole dock by class for exactly this reason: it is the one identifier
+/// Hyprland gives for a live window, and matching it to a `.desktop` id needs
+/// `StartupWMClass`, which not every app fills in. Mapping class to app is
+/// therefore a separate, deliberately fallible step, and the dock must render
+/// correctly when it fails.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Client {
+    /// Hyprland's window address, e.g. `0x55d1…`. Stable for the window's life
+    /// and the only safe key for focus and close.
+    pub address: String,
+    /// Window class, e.g. `kitty`. Empty classes are dropped rather than stored:
+    /// a client with no class cannot be grouped, and storing it would make every
+    /// count off by one.
+    pub class: String,
+    /// Workspace name this window is on.
+    pub workspace: String,
+    /// Is this the focused window?
+    pub active: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     FocusWorkspace { id: i64 },
@@ -88,6 +115,15 @@ pub trait Compositor: Send + Sync {
 
     /// Read the focused workspace.
     fn active_workspace(&self) -> anyhow::Result<Workspace>;
+
+    /// Read the open windows.
+    ///
+    /// Sorted by address so the order is stable between reads. Stability is not
+    /// cosmetic: the dock diffs its running list against the pinned one, and an
+    /// unstable order makes icons jump between reads for no reason the user did.
+    fn clients(&self) -> anyhow::Result<Vec<Client>> {
+        Ok(Vec::new())
+    }
 
     fn act(&self, action: Action) -> anyhow::Result<()>;
 

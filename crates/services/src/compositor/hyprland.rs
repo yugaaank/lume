@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 
-use super::{Action, Compositor, Workspace, hypr_socket_paths};
+use super::{Action, Client, Compositor, Workspace, hypr_socket_paths};
 /// IPC calls get their own short timeout so a wedged Hyprland cannot hang the
 /// UI's poll loop.
 const IPC_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -87,8 +87,14 @@ impl From<RawWorkspace> for Workspace {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 struct RawClient {
+    /// Hyprland's window address. Present on every 0.56 client.
+    address: String,
+    /// The window class. Empty for a handful of real windows (some launchers,
+    /// some Wine apps), which is why the mapping into `Client` drops them.
+    #[serde(default)]
+    class: String,
     /// Present in 0.56 output; `floating` is a plain bool, not 0/1.
     #[serde(default)]
     floating: bool,
@@ -96,7 +102,15 @@ struct RawClient {
     workspace: RawClientWorkspace,
 }
 
-#[derive(Default, serde::Deserialize)]
+/// The focused window. Hyprland has no "is focused" flag in the clients list, so
+/// this second query is the only way to know which one it is.
+#[derive(serde::Deserialize)]
+struct RawActiveWindow {
+    #[serde(default)]
+    address: String,
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
 struct RawClientWorkspace {
     #[serde(default)]
     name: String,
@@ -117,6 +131,36 @@ struct RawMonitor {
     refreshrate: f64,
 }
 
+/// Wire clients into the model: drop the ungroupable, mark the focused one,
+/// sort for a stable read-to-read order.
+///
+/// Separate from the query so it can be tested without a compositor, and so the
+/// rules are in one place: every rule about what counts as a dock entry lives
+/// here rather than being spread through the dock.
+fn to_clients(raw: Vec<RawClient>, active: &str) -> Vec<Client> {
+    let mut out: Vec<Client> = raw
+        .into_iter()
+        .filter_map(|c| {
+            // A window with no class cannot be grouped by anything. Keeping it
+            // would make every per-app count one too high.
+            if c.class.trim().is_empty() {
+                return None;
+            }
+            Some(Client {
+                active: !active.is_empty() && c.address == active,
+                address: c.address,
+                class: c.class,
+                workspace: c.workspace.name,
+            })
+        })
+        .collect();
+
+    // Stable order between reads. The dock diffs its running list against the
+    // pinned one, and an unstable order makes icons shuffle for no reason.
+    out.sort_by(|a, b| a.address.cmp(&b.address));
+    out
+}
+
 impl Compositor for Hyprland {
     fn workspaces(&self) -> anyhow::Result<Vec<Workspace>> {
         let raw: Vec<RawWorkspace> = query_json(&["-j", "workspaces"])?;
@@ -134,6 +178,21 @@ impl Compositor for Hyprland {
             .iter()
             .filter(|c| c.workspace.name == workspace)
             .any(RawClient::is_tiled))
+    }
+
+    fn clients(&self) -> anyhow::Result<Vec<Client>> {
+        let raw: Vec<RawClient> = query_json(&["-j", "clients"])?;
+
+        // Two queries, not one: the clients list carries no focus flag. Doing it
+        // here rather than in the service keeps one consistent snapshot — a
+        // client list and a separately-fetched active window can disagree about
+        // which window is focused, and the dock would then mark two tiles active
+        // or none.
+        let active = query_json::<RawActiveWindow>(&["-j", "activewindow"])
+            .map(|w| w.address)
+            .unwrap_or_default();
+
+        Ok(to_clients(raw, &active))
     }
 
     fn refresh_rate(&self) -> f64 {
@@ -235,6 +294,57 @@ mod tests {
             windows: 2
         }
         .is_special());
+    }
+
+    fn raw(address: &str, class: &str, ws: &str) -> RawClient {
+        serde_json::from_str(&format!(
+            r#"{{"address":"{address}","class":"{class}",
+                "floating":false,"workspace":{{"id":1,"name":"{ws}"}}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// A window with no class is not a dock entry. Not a hypothetical: some
+    /// launchers and a fair few Wine apps report one, and storing them would
+    /// make every per-app count read one too high.
+    #[test]
+    fn classless_windows_are_dropped() {
+        let out = to_clients(
+            vec![raw("0x2", "kitty", "1"), raw("0x1", "", "1"), raw("0x3", "  ", "1")],
+            "",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].class, "kitty");
+    }
+
+    #[test]
+    fn exactly_one_window_is_active() {
+        let out = to_clients(
+            vec![raw("0x1", "kitty", "1"), raw("0x2", "zen", "2")],
+            "0x2",
+        );
+        assert_eq!(out.iter().filter(|c| c.active).count(), 1);
+        assert!(out.iter().find(|c| c.class == "zen").unwrap().active);
+    }
+
+    /// An empty active address means "nothing focused", which is the normal
+    /// state on a bare desktop. Treating it as a match would mark the first
+    /// window active by accident, since no address is equal to "".
+    #[test]
+    fn no_focused_window_marks_nothing_active() {
+        let out = to_clients(vec![raw("0x1", "kitty", "1")], "");
+        assert!(!out[0].active);
+    }
+
+    /// The order must be identical between two reads of the same set, or the
+    /// dock's icons shuffle on every poll for no reason.
+    #[test]
+    fn order_is_stable_and_sorted_by_address() {
+        let input = vec![raw("0x30", "c", "1"), raw("0x10", "a", "1"), raw("0x20", "b", "1")];
+        let a = to_clients(input.clone(), "");
+        let b = to_clients(input, "");
+        assert_eq!(a, b);
+        assert_eq!(a.iter().map(|c| &c.address).collect::<Vec<_>>(), ["0x10", "0x20", "0x30"]);
     }
 
     /// Guards the 0.56 wire shape. `hasfullscreen` is a bool here; older

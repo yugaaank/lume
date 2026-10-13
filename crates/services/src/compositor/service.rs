@@ -14,7 +14,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::sync::Notify;
 
-use super::{Compositor, Workspace, hyprland};
+use super::{Client, Compositor, Workspace, hyprland};
 
 /// A nudge is coalesced, not counted.
 ///
@@ -37,6 +37,7 @@ pub struct CompositorService {
     inner: Arc<dyn Compositor>,
     workspaces: Arc<ArcSwap<Vec<Workspace>>>,
     active: Arc<ArcSwap<Workspace>>,
+    clients: Arc<ArcSwap<Vec<Client>>>,
     changed: Arc<Notify>,
 }
 
@@ -59,6 +60,10 @@ impl CompositorService {
 
         let workspaces = Arc::new(ArcSwap::from_pointee(inner.workspaces().unwrap_or_default()));
         let active = Arc::new(ArcSwap::from_pointee(active));
+        // Empty until the first poll lands. Deliberately not queried here: the
+        // constructor's job is to be able to answer immediately, and clients is
+        // the one thing the dock can render sensibly without.
+        let clients = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let changed = Arc::new(Notify::new());
 
         // Log before spawning, while the originals are still intact. Every
@@ -69,13 +74,14 @@ impl CompositorService {
             "compositor service up"
         );
 
-        let state = Self { inner, workspaces, active, changed };
+        let state = Self { inner, workspaces, active, clients, changed };
 
         spawn_poll_loop(
             handle.clone(),
             state.inner.clone(),
             state.workspaces.clone(),
             state.active.clone(),
+            state.clients.clone(),
             state.changed.clone(),
         );
         spawn_event_loop(
@@ -83,6 +89,7 @@ impl CompositorService {
             state.inner.clone(),
             state.workspaces.clone(),
             state.active.clone(),
+            state.clients.clone(),
             state.changed.clone(),
         );
 
@@ -96,6 +103,47 @@ impl CompositorService {
 
     pub fn active(&self) -> Arc<Workspace> {
         self.active.load_full()
+    }
+
+    /// The open windows, newest read last.
+    ///
+    /// Cheap: an atomic pointer load, safe from render. Sorted by address, so
+    /// the order is the same between reads and the dock can diff against it.
+    pub fn clients(&self) -> Arc<Vec<Client>> {
+        self.clients.load_full()
+    }
+
+    /// Windows belonging to `class`.
+    ///
+    /// Taken from the cached list rather than re-queried: the dock asks this on
+    /// every hover, and a `hyprctl` spawn per hover would make hovering slower
+    /// than the thing being hovered.
+    pub fn windows_of(&self, class: &str) -> Vec<Client> {
+        self.clients
+            .load()
+            .iter()
+            .filter(|c| c.class == class)
+            .cloned()
+            .collect()
+    }
+
+    /// How many windows `class` has open.
+    pub fn count_of(&self, class: &str) -> usize {
+        self.clients.load().iter().filter(|c| c.class == class).count()
+    }
+
+    /// The class of the focused window, if any window is focused.
+    ///
+    /// None is the normal state on a bare desktop, and the dock uses it: there
+    /// is nothing to get out of, so it shows itself. Ryoku reads this as
+    /// `anyFocused` and it is the one reveal condition that is not about the
+    /// pointer.
+    pub fn active_class(&self) -> Option<String> {
+        self.clients
+            .load()
+            .iter()
+            .find(|c| c.active)
+            .map(|c| c.class.clone())
     }
 
     /// Clone this once and hold the clone, not the service.
@@ -145,6 +193,7 @@ fn spawn_poll_loop(
     compositor: Arc<dyn Compositor>,
     workspaces: Arc<ArcSwap<Vec<Workspace>>>,
     active: Arc<ArcSwap<Workspace>>,
+    clients: Arc<ArcSwap<Vec<Client>>>,
     changed: Arc<Notify>,
 ) {
     handle.spawn(async move {
@@ -165,6 +214,18 @@ fn spawn_poll_loop(
                 }
             }
 
+            // Only notify when the list actually differs. Every compositor event
+            // reaches this loop, and a notification that changes nothing wakes
+            // the dock for a re-render that draws the same pixels.
+            if let Ok(list) = compositor.clients() {
+                if **clients.load() != list {
+                    clients.store(Arc::new(list));
+                    changed.notify_one();
+                }
+            } else {
+                tracing::debug!("client poll failed");
+            }
+
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
@@ -175,6 +236,7 @@ fn spawn_event_loop(
     _compositor: Arc<dyn Compositor>,
     workspaces: Arc<ArcSwap<Vec<Workspace>>>,
     active: Arc<ArcSwap<Workspace>>,
+    clients: Arc<ArcSwap<Vec<Client>>>,
     changed: Arc<Notify>,
 ) {
     // The socket listener is blocking, so it gets its own thread rather than a
@@ -188,6 +250,7 @@ fn spawn_event_loop(
                 let workspaces = workspaces.clone();
                 let changed = changed.clone();
                 let active = active.clone();
+                let clients = clients.clone();
                 // FnMut: called once per event line. Capture the Handle by
                 // reference and clone per call, or the first call moves it and
                 // the second fails to compile — or worse, panics at runtime.
