@@ -60,6 +60,11 @@ pub struct Client {
     pub class: String,
     /// Workspace name this window is on.
     pub workspace: String,
+    /// Output index. Carried because Hyprland's focus dispatch will not accept a
+    /// window address on its own — `focus({window})` answers "window not
+    /// found" while `focus({window, monitor})` works — so the dock cannot focus
+    /// a window without knowing which output it is on.
+    pub monitor: i32,
     /// Is this the focused window?
     pub active: bool,
 }
@@ -68,6 +73,12 @@ pub struct Client {
 pub enum Action {
     FocusWorkspace { id: i64 },
     ToggleSpecialWorkspace,
+    /// Focus a window. Used by the dock to switch between an app's windows, and
+    /// to raise one from another workspace.
+    FocusWindow {
+        address: String,
+        monitor: i32,
+    },
     FloatWindow { address: String },
     CloseWindow { address: String },
     Quit,

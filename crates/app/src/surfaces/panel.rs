@@ -8,6 +8,7 @@
 //! `hicolor` — the same lookup a GTK client does.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use services::apps::AppEntry;
 pub use services::config::DockMode;
 
 use super::{DOCK_HEIGHT, SIDEBAR_WIDTH};
+use services::compositor::Action;
 use services::intent::Side;
 
 
@@ -54,17 +56,26 @@ pub struct Dock {
     focus: FocusHandle,
     items: Vec<DockItem>,
     hovered: Option<usize>,
-    /// Id of the app whose window is focused, if it is a dock item.
-    focused_app: Option<String>,
     mode: DockMode,
     enabled: bool,
     trigger_px: f32,
     demand: Rc<DockDemand>,
     shown: bool,
+    /// Aligned with `items`. Recomputed on every compositor change, never per
+    /// frame.
+    runs: Vec<Run>,
 }
 
 /// How often the dock re-reads the pointer while autohide is on.
 pub const DOCK_POLL_MS: u64 = 50;
+
+/// How far an icon with no windows is faded back.
+///
+/// Ryoku desaturates and tints an idle icon toward bone, which needs a shader
+/// effect. This fork has no public custom shader API, so the honest available
+/// lever is opacity: an icon with nothing open recedes, a running one is at
+/// full strength. It carries the same meaning and costs nothing to draw.
+const IDLE_ICON: f32 = 0.42;
 
 /// One tile's box. The surface needs these to build an input region that
 /// covers the tiles and the peek strip and nothing else, so a visible dock
@@ -90,6 +101,17 @@ impl Dock {
 pub struct DockItem {
     pub app: AppEntry,
     pub pinned: bool,
+}
+
+/// What the compositor says about one tile.
+#[derive(Default, Clone, Copy, PartialEq)]
+struct Run {
+    /// Open windows belonging to this app.
+    count: usize,
+    /// One of them is focused. Distinct from `count`: "running" and "active"
+    /// are different questions, and a dock that answers both with one mark
+    /// cannot say either.
+    active: bool,
 }
 
 impl Dock {
@@ -130,12 +152,12 @@ impl Dock {
             focus: cx.focus_handle(),
             items,
             hovered: None,
-            focused_app: None,
             mode: dock.mode,
             enabled: dock.enabled,
             trigger_px: dock.trigger_px,
             demand: Rc::new(DockDemand::default()),
             shown,
+            runs: Vec::new(),
         }
     }
 
@@ -173,6 +195,97 @@ impl Dock {
 
     /// Re-read the compositor and recompute visibility. Cheap: the expensive
     /// part is skipped unless the mode actually consults it.
+    /// Recompute which tiles are running and which is active.
+    ///
+    /// One pass over the compositor's windows, grouped by the app each one
+    /// resolves to. Grouping by the *index* rather than by guessing a class per
+    /// tile means the two directions cannot disagree: the same `by_class` answer
+    /// decides both what a window counts towards and what a tile claims.
+    fn refresh_runs(&mut self, cx: &mut Context<Self>) {
+        let state = cx.global::<services::AppState>();
+        let mut runs: Vec<Run> = self
+            .items
+            .iter()
+            .map(|item| Run::default())
+            .collect();
+        let by_id: HashMap<&str, usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (item.app.id.as_str(), i))
+            .collect();
+
+        for client in state.compositor.clients().iter() {
+            let Some(app) = state.apps.by_class(&client.class) else {
+                // A window whose class matches no desktop entry lights nothing.
+                // Guessing here would light the wrong tile, which is worse than
+                // lighting none.
+                continue;
+            };
+            let Some(slot) = by_id.get(app.id.as_str()) else { continue };
+            runs[*slot].count += 1;
+            runs[*slot].active |= client.active;
+        }
+
+        if self.runs != runs {
+            self.runs = runs;
+            cx.notify();
+        }
+    }
+
+    /// What a click does, following Ryoku's `activate`.
+    ///
+    /// No windows → launch, because that is the only way to get the app up.
+    /// Already focused → the next window of that app, which is what a dock
+    /// click has always meant and is the reason a dock is faster than a window
+    /// switcher. Otherwise → focus one, preferring the active workspace so a
+    /// click does not drag you sideways across desktops.
+    ///
+    /// Launching unconditionally instead — which is what this did — spawns a
+    /// second copy of an app you already have open, every time.
+    fn activate(&mut self, id: &str, cx: &mut Context<Self>) {
+        let state = cx.global::<services::AppState>();
+
+        let windows: Vec<services::compositor::Client> = state
+            .compositor
+            .clients()
+            .iter()
+            .filter(|c| state.apps.by_class(&c.class).is_some_and(|a| a.id == id))
+            .cloned()
+            .collect();
+
+        let target = if windows.is_empty() {
+            None
+        } else {
+            let workspace = state.compositor.active().name.clone();
+            Some(match windows.iter().position(|c| c.active) {
+                // Focused already: advance to the next window, wrapping.
+                Some(i) => &windows[(i + 1) % windows.len()],
+                None => windows
+                    .iter()
+                    .find(|c| c.workspace == workspace)
+                    .unwrap_or(&windows[0]),
+            })
+        };
+
+        match target {
+            Some(client) => {
+                if let Err(e) = state.compositor.act(Action::FocusWindow {
+                    address: client.address.clone(),
+                    monitor: client.monitor,
+                }) {
+                    tracing::warn!(address = %client.address, "could not focus window: {e:#}");
+                }
+            }
+            None => {
+                if let Some(entry) = state.apps.get(id) {
+                    super::background::launch_public(&entry);
+                }
+            }
+        }
+        self.refresh(cx);
+    }
+
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let state = cx.global::<services::AppState>();
         if self.mode == DockMode::Dodge {
@@ -195,6 +308,8 @@ impl Dock {
             tracing::debug!(?self.mode, shown, "dock visibility");
             cx.notify();
         }
+
+        self.refresh_runs(cx);
     }
 
         /// Distance from the bottom edge that reveals an autohiding dock. Also the
@@ -214,12 +329,6 @@ impl Dock {
         self.trigger_px
     }
 
-    pub fn set_focused_app(&mut self, id: Option<String>, cx: &mut Context<Self>) {
-        if self.focused_app != id {
-            self.focused_app = id;
-            cx.notify();
-        }
-    }
 }
 
 impl Focusable for Dock {
@@ -266,40 +375,41 @@ impl Render for Dock {
 
         let buttons = self.items.iter().enumerate().map(|(i, item)| {
             let app = item.app.clone();
-            let is_focused = self.focused_app.as_deref() == Some(app.id.as_str());
+            let run = self.runs.get(i).copied().unwrap_or_default();
             let is_hovered = self.hovered == Some(i);
 
             // The plate. Every dock icon sits on its own hairline-bordered
             // square rather than floating bare on the band: the reference
             // dock's icons are tiles, and a bare icon on a strip reads as a
             // list of files. The border is what makes it a tile.
+            //
+            // Square, not rounded. Ryoku's `seal` is the style this dock is
+            // built from and its plate has radius 0; the other four styles
+            // round theirs. Rounding here is decoration borrowed from a
+            // different style.
             div()
                 .id(("lume-dock-item", hash_of(&app.id)))
                 .size(px(TILE))
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(services::theme::radius::CARD))
                 .border_1()
-                .border_color(if is_focused { t.line_strong() } else { t.line_soft() })
+                .border_color(if run.active { t.line_strong() } else { t.line_soft() })
                 .cursor_pointer()
                 // Hover is a fill, never a border change: swapping the border
                 // colour would make the tile appear to change size by a pixel.
                 .bg(if is_hovered { t.control_hover() } else { t.ink_a(0.0) })
                 .hover(|h| h.bg(t.control_hover()))
-                .child(icon(&app.icon, &app.name, 40.0))
+                .child(
+                    div()
+                        .opacity(if run.count == 0 { IDLE_ICON } else { 1.0 })
+                        .child(icon(&app.icon, &app.name, 40.0)),
+                )
                 .on_click({
                     let this = this.clone();
+                    let id = app.id.clone();
                     move |_, _w, cx| {
-                        let id = app.id.clone();
-                        this.update(cx, |me, cx| {
-                            if let Some(entry) =
-                                cx.global::<services::AppState>().apps.get(&id)
-                            {
-                                super::background::launch_public(&entry);
-                            }
-                            cx.notify();
-                        });
+                        this.update(cx, |me, cx| me.activate(&id, cx));
                     }
                 })
                 .on_hover({
@@ -318,33 +428,29 @@ impl Render for Dock {
                         })
                     }
                 })
-                // The running marker: a corner tick in the accent, drawn in the
-                // tile's top-left. A bar underneath would say "this is the
-                // focused window"; a corner tick says "this app is running",
-                // which is the question a dock actually gets asked, and it is
-                // what the reference does.
-                .child(
+                // The active mark: a bone L-bracket in the corner.
+                //
+                // Bone, not the accent — the reference draws it in the inverted
+                // ink, and an accent bracket says "this app has something going
+                // on" rather than "this is the window you are looking at".
+                // Accent was wrong here.
+                //
+                // Two rules, not a filled corner and not an outline: a filled
+                // corner reads as a tab, and a whole-square outline reads as a
+                // second border competing with the plate's own.
+                .child(if run.active {
                     div()
                         .absolute()
-                        .left_0()
-                        .top_0()
-                        .size(px(12.0))
-                        // Only drawn when running, so this is conditional rather
-                        // than an always-there transparent child.
-                        .child(if is_focused {
-                            div()
-                                .absolute()
-                                .left(px(5.0))
-                                .top(px(5.0))
-                                .size(px(5.0))
-                                .border_l_1()
-                                .border_t_1()
-                                .border_color(t.accent_a(1.0))
-                                .into_any_element()
-                        } else {
-                            div().into_any_element()
-                        }),
-                )
+                        .left(px(4.0))
+                        .top(px(4.0))
+                        .size(px(9.0))
+                        .border_l_2()
+                        .border_t_2()
+                        .border_color(t.bone_fill())
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                })
         });
 
         // No background at all. Each tile carries its own hairline box and the

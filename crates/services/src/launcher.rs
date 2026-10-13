@@ -147,6 +147,7 @@ mod tests {
             icon: String::new(),
             terminal: false,
             path: std::path::PathBuf::from(id),
+            wm_class: None,
         }
     }
 

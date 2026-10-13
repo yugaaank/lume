@@ -27,6 +27,13 @@ pub struct AppEntry {
     pub icon: String,
     pub terminal: bool,
     pub path: PathBuf,
+    /// `StartupWMClass`, the window class this app's windows report.
+    ///
+    /// The bridge from a live Hyprland window to a dock tile. It is optional in
+    /// the spec and absent from most of what is installed — 27 of 216 desktop
+    /// entries on this machine — so it is one of several guesses rather than
+    /// the answer. See [`AppIndex::by_class`].
+    pub wm_class: Option<String>,
 }
 
 impl AppEntry {
@@ -90,6 +97,31 @@ pub fn scan() -> Vec<AppEntry> {
     list
 }
 
+/// Build the class -> desktop id map.
+///
+/// Each app contributes up to three keys, weakest last, so a strong key written
+/// by one app is never stolen by a weak key from another. A duplicate key keeps
+/// the entry that already holds it, which makes the result depend only on the
+/// sorted list rather than on scan order.
+fn class_index(entries: &[AppEntry]) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for app in entries {
+        let stem = app.id.strip_suffix(".desktop").unwrap_or(&app.id);
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(w) = &app.wm_class {
+            keys.push(w.clone());
+        }
+        keys.push(stem.to_string());
+        if let Some((head, _)) = stem.split_once('_') {
+            keys.push(head.to_string());
+        }
+        for key in keys {
+            map.entry(key).or_insert_with(|| app.id.clone());
+        }
+    }
+    map
+}
+
 fn parse_file(id: &str, path: &Path) -> Option<AppEntry> {
     // Real-world .desktop files are not all UTF-8. from_utf8_lossy rather than
     // a hard failure.
@@ -98,17 +130,17 @@ fn parse_file(id: &str, path: &Path) -> Option<AppEntry> {
     let fields = parse_desktop(&text);
 
     // Hidden and NoDisplay are the two ways a package says "do not show me".
-    if fields.get("Hidden").is_some_and(|v| v == "true") {
+    if fields.get("hidden").is_some_and(|v| v == "true") {
         return None;
     }
-    if fields.get("NoDisplay").is_some_and(|v| v == "true") {
+    if fields.get("nodisplay").is_some_and(|v| v == "true") {
         return None;
     }
-    if fields.get("Type").is_some_and(|v| v != "Application") {
+    if fields.get("type").is_some_and(|v| v != "Application") {
         return None;
     }
 
-    let name = fields.get("Name")?.clone();
+    let name = fields.get("name")?.clone();
     if name.trim().is_empty() {
         return None;
     }
@@ -116,11 +148,15 @@ fn parse_file(id: &str, path: &Path) -> Option<AppEntry> {
     Some(AppEntry {
         id: id.to_string(),
         name,
-        generic_name: fields.get("GenericName").cloned().unwrap_or_default(),
-        exec: fields.get("Exec")?.clone(),
-        icon: fields.get("Icon").cloned().unwrap_or_default(),
-        terminal: fields.get("Terminal").is_some_and(|v| v == "true"),
+        generic_name: fields.get("genericname").cloned().unwrap_or_default(),
+        exec: fields.get("exec")?.clone(),
+        icon: fields.get("icon").cloned().unwrap_or_default(),
+        terminal: fields.get("terminal").is_some_and(|v| v == "true"),
         path: path.to_path_buf(),
+        wm_class: fields
+            .get("startupwmclass")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     })
 }
 
@@ -147,8 +183,13 @@ fn parse_desktop(text: &str) -> HashMap<String, String> {
         }
 
         // Values may contain '='; only the first one separates.
+        //
+        // Keys go in lowercased because the spec says they are
+        // case-insensitive and real files break that: alongside the usual
+        // `StartupWMClass` there are desktop entries carrying `startupwmclass`
+        // and `STARTUPWMCLASS`. Every lookup below is lowercase to match.
         if let Some((k, v)) = line.split_once('=') {
-            out.insert(k.trim().to_string(), v.trim().to_string());
+            out.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
 
@@ -373,22 +414,86 @@ mod tests {
     fn hidden_and_nodisplay_are_skipped() {
         let text = "[Desktop Entry]\nType=Application\nName=X\nHidden=true\nExec=x\n";
         let f = parse_desktop(text);
-        assert_eq!(f.get("Hidden").unwrap(), "true");
+        assert_eq!(f.get("hidden").unwrap(), "true");
+    }
+
+    /// The spec says keys are case-insensitive and real files break that:
+    /// `startupwmclass` and `STARTUPWMCLASS` both occur in the wild.
+    #[test]
+    fn keys_are_case_insensitive() {
+        let f = parse_desktop("[Desktop Entry]\nNAME=Mixed\nstartupwmclass=zed\n");
+        assert_eq!(f.get("name").unwrap(), "Mixed");
+        assert_eq!(f.get("startupwmclass").unwrap(), "zed");
     }
 
     #[test]
     fn only_desktop_entry_group_is_read() {
         let text = "[Desktop Entry]\nName=Real\n\n[Desktop Action Foo]\nName=Fake\n";
         let f = parse_desktop(text);
-        assert_eq!(f.get("Name").unwrap(), "Real");
-        assert!(!f.contains_key("Exec"));
+        assert_eq!(f.get("name").unwrap(), "Real");
+        assert!(!f.contains_key("exec"));
+    }
+
+    fn entry(id: &str, wm_class: Option<&str>) -> AppEntry {
+        AppEntry {
+            id: id.into(),
+            name: id.into(),
+            generic_name: String::new(),
+            exec: "true".into(),
+            icon: String::new(),
+            terminal: false,
+            path: PathBuf::from(id),
+            wm_class: wm_class.map(str::to_string),
+        }
+    }
+
+    /// The three guesses, in order. `StartupWMClass` when it exists, the id
+    /// stem, and the stem before the first underscore.
+    #[test]
+    fn class_index_covers_the_three_guesses() {
+        let map = class_index(&[
+            entry("kitty.desktop", None),
+            entry("firefox_firefox.desktop", None),
+            entry("zen.desktop", Some("zen")),
+        ]);
+        assert_eq!(map["kitty"], "kitty.desktop");
+        assert_eq!(map["firefox"], "firefox_firefox.desktop");
+        assert_eq!(map["firefox_firefox"], "firefox_firefox.desktop");
+        assert_eq!(map["zen"], "zen.desktop");
+    }
+
+    /// A declared class must win over a stem that merely looks like it. If
+    /// `weird.desktop` declares `StartupWMClass=other`, the class `other` is
+    /// its window class, and matching it to `other.desktop` would light the
+    /// wrong tile.
+    #[test]
+    fn a_declared_class_is_not_stolen_by_a_weak_key() {
+        let map = class_index(&[entry("weird.desktop", Some("other")), entry("other.desktop", None)]);
+        assert_eq!(map["other"], "weird.desktop");
+    }
+
+    /// An unidentifiable class is a normal outcome, not an error: it must miss
+    /// rather than guess.
+    #[test]
+    fn an_unknown_class_is_not_matched() {
+        let map = class_index(&[entry("kitty.desktop", None)]);
+        assert!(!map.contains_key("somethingelse"));
+    }
+
+    /// The result must not depend on scan order, or an install reshuffles which
+    /// app a class resolves to.
+    #[test]
+    fn class_index_is_order_independent() {
+        let a = entry("kitty.desktop", None);
+        let b = entry("weird.desktop", Some("other"));
+        assert_eq!(class_index(&[a.clone(), b.clone()]), class_index(&[b, a]));
     }
 
     #[test]
     fn values_may_contain_equals() {
         let text = "[Desktop Entry]\nExec=env A=1 B=2 prog\n";
         let f = parse_desktop(text);
-        assert_eq!(f.get("Exec").unwrap(), "env A=1 B=2 prog");
+        assert_eq!(f.get("exec").unwrap(), "env A=1 B=2 prog");
     }
 }
 /// The application index.
@@ -398,16 +503,23 @@ mod tests {
 /// a shared handle to the same slot rather than a copy of it.
 pub struct AppIndex {
     entries: Arc<ArcSwap<Vec<AppEntry>>>,
+    /// Window class -> desktop id. Rebuilt with the entries.
+    ///
+    /// A `HashMap` and not a scan per lookup because the dock asks on every
+    /// tile, on every refresh, while a compositor event is arriving.
+    classes: Arc<ArcSwap<HashMap<String, String>>>,
     /// Kept alive deliberately: a dropped watcher stops watching, silently.
     _watcher: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl AppIndex {
     pub fn new() -> Self {
-        let cached = Arc::new(ArcSwap::from_pointee(scan()));
+        let list = scan();
+        let cached = Arc::new(ArcSwap::from_pointee(list.clone()));
+        let classes = Arc::new(ArcSwap::from_pointee(class_index(&list)));
         let watcher = user_dir()
-            .and_then(|dir| make_watcher(dir, cached.clone()));
-        Self { entries: cached, _watcher: watcher }
+            .and_then(|dir| make_watcher(dir, cached.clone(), classes.clone()));
+        Self { entries: cached, classes, _watcher: watcher }
     }
 
     /// Cheap: an atomic pointer load.
@@ -419,13 +531,33 @@ impl AppIndex {
         self.entries.load().iter().find(|a| a.id == id).cloned()
     }
 
+    /// The app whose windows report `class`, if one can be identified.
+    ///
+    /// Three guesses, in order, because none of them is reliable on its own:
+    ///
+    /// 1. `StartupWMClass`. Correct when present — and present on only 27 of the
+    ///    216 desktop entries installed here.
+    /// 2. The desktop id's stem: `kitty.desktop` matches the class `kitty`.
+    /// 3. That stem before the first underscore: `firefox_firefox.desktop`
+    ///    matches `firefox`.
+    ///
+    /// `None` is the common case and is not a failure. A window whose class
+    /// matches nothing simply does not light up a tile; it must not produce a
+    /// wrong tile, which is worse than none.
+    pub fn by_class(&self, class: &str) -> Option<AppEntry> {
+        let id = self.classes.load().get(class).cloned()?;
+        self.get(&id)
+    }
+
     /// First free grid cell for a new icon.
     pub fn first_free_cell(&self, used: &[usize]) -> usize {
         (0..).find(|c| !used.contains(c)).unwrap_or(0)
     }
 
     pub fn rescan(&self) {
-        self.entries.store(Arc::new(scan()));
+        let list = scan();
+        self.entries.store(Arc::new(list.clone()));
+        self.classes.store(Arc::new(class_index(&list)));
     }
 }
 
@@ -437,6 +569,7 @@ impl AppIndex {
 fn make_watcher(
     dir: PathBuf,
     cached: Arc<ArcSwap<Vec<AppEntry>>>,
+    classes: Arc<ArcSwap<HashMap<String, String>>>,
 ) -> Option<Box<dyn std::any::Any + Send>> {
     use notify::{RecursiveMode, Watcher};
 
@@ -456,11 +589,16 @@ fn make_watcher(
         }
 
         let cached = cached.clone();
+        let classes = classes.clone();
         tokio::spawn(async move {
             // Debounce: installing a package produces a burst of events and
             // each one would otherwise trigger a full rescan.
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            cached.store(Arc::new(scan()));
+            let list = scan();
+            // Both stores, or the class map goes stale on any install and the
+            // dock silently stops recognising every app the new package brought.
+            cached.store(Arc::new(list.clone()));
+            classes.store(Arc::new(class_index(&list)));
             tracing::info!("app index rescan complete");
         });
     });

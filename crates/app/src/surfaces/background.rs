@@ -136,6 +136,9 @@ fn launcher_entry(path: &std::path::Path) -> Option<apps::AppEntry> {
         icon: String::new(),
         terminal: false,
         path: path.to_path_buf(),
+        // A .desktop file on the desktop, not an installed app: it has no
+        // window class because it is not an app.
+        wm_class: None,
     };
 
     let mut section_ok = false;

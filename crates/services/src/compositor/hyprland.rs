@@ -190,6 +190,8 @@ struct RawClient {
     floating: bool,
     #[serde(default)]
     workspace: RawClientWorkspace,
+    #[serde(default)]
+    monitor: i32,
 }
 
 /// The focused window. Hyprland has no "is focused" flag in the clients list, so
@@ -245,6 +247,7 @@ fn to_clients(raw: Vec<RawClient>, active: &str) -> Vec<Client> {
                 address: c.address,
                 class: c.class,
                 workspace: c.workspace.name,
+                monitor: c.monitor,
             })
         })
         .collect();
@@ -345,6 +348,14 @@ impl Compositor for Hyprland {
             Action::FocusWorkspace { id } => format!("hl.dsp.focus({{ workspace = {id} }})"),
             Action::ToggleSpecialWorkspace => {
                 "hl.dsp.workspace.toggle_special()".to_string()
+            }
+            // The `monitor` argument is not optional in practice: with only a
+            // `window` key, Hyprland answers "window not found" for an address
+            // that `hyprctl -j clients` is currently reporting. With both it
+            // resolves. Every spelling of `window` alone was tried — address
+            // string, address without 0x, decimal, pid — and all four fail.
+            Action::FocusWindow { address, monitor } => {
+                format!("hl.dsp.focus({{ window = {address:?}, monitor = {monitor} }})")
             }
             Action::FloatWindow { address } => {
                 format!("hl.dsp.window.float({{ address = {address:?} }})")
