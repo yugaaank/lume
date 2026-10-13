@@ -151,9 +151,15 @@ mod tests {
             Command::Picker(services::intent::PickerOp::Toggle),
             Command::Picker(services::intent::PickerOp::Open),
             Command::Picker(services::intent::PickerOp::Close),
-            Command::Drawer(Some("volume".into())),
-            Command::Drawer(Some("network".into())),
-            Command::Drawer(None),
+            Command::Drawer(
+                Some("volume".into()),
+                services::intent::DrawerOp::Toggle,
+            ),
+            Command::Drawer(
+                Some("network".into()),
+                services::intent::DrawerOp::Open,
+            ),
+            Command::Drawer(None, services::intent::DrawerOp::Close),
             Command::Launcher(services::intent::LauncherOp::Open),
             Command::Launcher(services::intent::LauncherOp::Close),
         ] {

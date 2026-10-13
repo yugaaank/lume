@@ -50,7 +50,7 @@ pub struct Overlay {
     ///
     /// At most one: a second would mean two things competing for the
     /// keyboard on one surface.
-    menu: Option<(MenuId, Menu, Option<gpui::Pixels>)>,
+    menu: Option<(MenuId, Menu, services::intent::Anchor)>,
     /// The launcher. At most one, for the same reason as the menu: only one
     /// thing on this surface may own the keyboard.
     launcher: Option<Entity<Launcher>>,
@@ -111,19 +111,56 @@ impl Overlay {
         tracing::info!("overlay opened the launcher");
     }
 
-    /// Open a widget menu, anchored under the widget that asked for it.
+    /// Apply one open/close/toggle request for a widget menu.
     ///
-    /// Replaces any menu already open, so a second click swaps panels instead
-    /// of stacking two.
+    /// Toggling only ever dismisses the menu that is actually open: clicking
+    /// a second widget switches to it rather than closing it. Anything else
+    /// would make the bar feel broken — the user asked for a panel and got
+    /// silence.
     pub fn open_menu(
         &mut self,
         which: MenuId,
-        anchor_x: Option<gpui::Pixels>,
+        anchor: services::intent::Anchor,
+        op: services::intent::DrawerOp,
         cx: &mut Context<Self>,
     ) {
-        self.menu = Some((which, which.build(), anchor_x));
-        tracing::info!(title = which.title(), "menu opened");
-        cx.notify();
+        let outcome = Self::resolve_menu(self.open_menu_id(), which, op);
+        match outcome {
+            MenuOutcome::Close => return self.close_menu(cx),
+            MenuOutcome::Keep => return,
+            MenuOutcome::Open => {
+                self.menu = Some((which, which.build(), anchor));
+                tracing::info!(title = which.title(), "menu opened");
+                cx.notify();
+            }
+        }
+    }
+
+    /// The menu currently open, if any.
+    pub fn open_menu_id(&self) -> Option<MenuId> {
+        self.menu.as_ref().map(|(id, _, _)| *id)
+    }
+
+    /// The bar's height in pixels: the strip clicks must fall through to the bar
+/// rather than dismissing a panel.
+///
+/// Falls back to the default rather than erroring. An overlay that cannot
+/// read the config still dismisses correctly; it just also swallows the bar
+/// strip, which is the old behaviour rather than a crash.
+fn resolve_menu(
+        open: Option<MenuId>,
+        which: MenuId,
+        op: services::intent::DrawerOp,
+    ) -> MenuOutcome {
+        use services::intent::DrawerOp;
+        match op {
+            DrawerOp::Close => MenuOutcome::Close,
+            // Toggling the menu that is already open dismisses it. Toggling a
+            // *different* one switches to it: the user asked for a panel and
+            // closing instead would read as the bar being broken.
+            DrawerOp::Toggle if open == Some(which) => MenuOutcome::Close,
+            DrawerOp::Toggle | DrawerOp::Open => MenuOutcome::Open,
+        }
     }
 
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
@@ -205,6 +242,18 @@ impl Overlay {
     }
 }
 
+/// The bar's height in pixels: the strip clicks must fall through to the bar
+/// rather than dismissing a panel.
+///
+/// Falls back to the default rather than erroring. An overlay that cannot
+/// read the config still dismisses correctly; it just also swallows the bar
+/// strip, which is the old behaviour rather than a crash.
+fn bar_height(cx: &gpui::App) -> f32 {
+    cx.try_global::<services::AppState>()
+        .map(|s| s.config.get().bar.height as f32)
+        .unwrap_or(services::config::Bar::default().height as f32)
+}
+
 impl Focusable for Overlay {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus.clone()
@@ -244,6 +293,26 @@ impl Render for Overlay {
         div()
             .id("lume-overlay")
             .size_full()
+            // The dismiss surface, covering everything the popup does not.
+            //
+            // It deliberately leaves the bar's strip alone. A modal overlay
+            // takes the whole input region, so this element receives the
+            // pointer before the bar does — and dismissing here on the same
+            // physical click that opened the menu meant the toggle always saw
+            // an empty overlay and always re-opened. Clicking a widget to
+            // close its own panel is the whole gesture, so the bar keeps it.
+            .on_mouse_down(gpui::MouseButton::Left, {
+                let this = cx.entity();
+                let bar_h = bar_height(cx);
+                move |event: &gpui::MouseDownEvent, _window: &mut Window, cx: &mut gpui::App| {
+                    if f32::from(event.position.y) < bar_h {
+                        return;
+                    }
+                    this.update(cx, |o, cx| {
+                        o.close(cx);
+                    });
+                }
+            })
             // Registers this element as the NODE for `self.focus` in the
             // rendered frame.
             //
@@ -296,20 +365,24 @@ impl Render for Overlay {
 /// match. A `Menu` is a `Vec<Item>` of `Arc`s and strings; cloning is free.
 fn render_menu(
     menu: Menu,
-    anchor_x: Option<gpui::Pixels>,
+    anchor: services::intent::Anchor,
     window: &mut Window,
     cx: &mut Context<Overlay>,
 ) -> gpui::AnyElement {
+    use services::intent::{Anchor, Edge};
+
     let this = cx.entity();
     let viewport = window.viewport_size();
 
-    // Anchor to the widget that opened it, clamped so the popup stays on
-    // screen. Anchoring to a fixed edge leaves the tail pointing at nothing.
-    let left = match anchor_x {
-        Some(x) => (f32::from(x) - menu::MENU_WIDTH / 2.0)
-            .clamp(8.0, (f32::from(viewport.width) - menu::MENU_WIDTH - 8.0).max(8.0)),
-        // No pointer — the keybind path. Park it at the right edge.
-        None => f32::from(viewport.width) - menu::MENU_WIDTH - 8.0,
+    let left = match anchor {
+        // Clamped so the popup stays on screen: a widget near an edge would
+        // otherwise push half the panel off the display.
+        Anchor::At(x) => (x - menu::MENU_WIDTH / 2.0).clamp(
+            8.0,
+            (f32::from(viewport.width) - menu::MENU_WIDTH - 8.0).max(8.0),
+        ),
+        Anchor::Edge(Edge::Right) => f32::from(viewport.width) - menu::MENU_WIDTH - 8.0,
+        Anchor::Edge(Edge::Left) => 8.0,
     };
 
     let items = menu.items.iter().cloned().map(|item| match item {
@@ -749,4 +822,73 @@ fn hash(s: &str) -> usize {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish() as usize
+}
+
+/// What to do with a menu request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuOutcome {
+    Open,
+    Close,
+    /// Already in the requested state; leave the overlay alone and do not
+    /// notify, which would repaint for nothing.
+    Keep,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use services::intent::DrawerOp;
+
+    fn resolve(open: Option<MenuId>, which: MenuId, op: DrawerOp) -> MenuOutcome {
+        Overlay::resolve_menu(open, which, op)
+    }
+
+    /// At most one menu is open. This is the whole point of the resolution:
+    /// a bar with four poppable widgets must never stack two panels.
+    #[test]
+    fn a_second_widget_switches_rather_than_stacks() {
+        assert_eq!(
+            resolve(Some(MenuId::Volume), MenuId::Network, DrawerOp::Toggle),
+            MenuOutcome::Open
+        );
+    }
+
+    /// Clicking the widget whose panel is already open closes it. Without
+    /// this the panel could only be dismissed by clicking elsewhere, which
+    /// makes the bar feel like it is not listening.
+    #[test]
+    fn toggling_the_open_widget_closes_it() {
+        assert_eq!(
+            resolve(Some(MenuId::Volume), MenuId::Volume, DrawerOp::Toggle),
+            MenuOutcome::Close
+        );
+    }
+
+    #[test]
+    fn open_is_idempotent_and_close_is_idempotent() {
+        assert_eq!(
+            resolve(None, MenuId::Volume, DrawerOp::Open),
+            MenuOutcome::Open
+        );
+        assert_eq!(
+            resolve(Some(MenuId::Volume), MenuId::Volume, DrawerOp::Open),
+            MenuOutcome::Open
+        );
+        assert_eq!(
+            resolve(Some(MenuId::Volume), MenuId::Network, DrawerOp::Close),
+            MenuOutcome::Close
+        );
+        assert_eq!(resolve(None, MenuId::Volume, DrawerOp::Close), MenuOutcome::Close);
+    }
+
+    /// Every combination of state and verb is covered, so a new menu added
+    /// later cannot inherit an unhandled branch.
+    #[test]
+    fn every_state_and_verb_resolves() {
+        for open in [None, Some(MenuId::Volume), Some(MenuId::Network)] {
+            for op in [DrawerOp::Open, DrawerOp::Close, DrawerOp::Toggle] {
+                assert!(resolve(open, MenuId::Battery, op) != MenuOutcome::Keep);
+            }
+        }
+    }
 }

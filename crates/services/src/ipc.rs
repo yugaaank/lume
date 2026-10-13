@@ -35,12 +35,12 @@ pub enum Command {
     Panel(intent::Side, Option<bool>),
     /// Open, close or toggle the wallpaper picker.
     Picker(intent::PickerOp),
-    /// Open a widget menu. No argument closes it.
+    /// Open, close or toggle a widget menu. No name closes it.
     ///
-    /// The CLI path has no pointer, so `anchor_x` is `None` and the menu
-    /// falls back to the right edge — which is also what a keybind wants,
-    /// since there is no cell to point at.
-    Drawer(Option<String>),
+    /// The CLI path has no pointer, so it docks to an edge. Which one is
+    /// part of the request rather than a fallback, because a keybind should
+    /// open the panel where the user is looking.
+    Drawer(Option<String>, intent::DrawerOp),
     /// Open or close the launcher. No argument is a malformed request.
     Launcher(intent::LauncherOp),
     /// No command — the shell was already running.
@@ -82,8 +82,12 @@ impl Command {
                 intent::PickerOp::Close => "wallpaper off".into(),
                 intent::PickerOp::Toggle => "wallpaper toggle".into(),
             },
-            Command::Drawer(Some(name)) => format!("drawer {name}"),
-            Command::Drawer(None) => "drawer close".into(),
+            Command::Drawer(Some(name), op) => format!("drawer {name} {}", op.as_str()),
+            // A nameless close has to carry its verb too. `drawer close`
+            // would decode back as a nameless *toggle* — the verb is
+            // ambiguous with the name position, and a close that silently
+            // became a toggle would close a panel and reopen it.
+            Command::Drawer(None, op) => format!("drawer close {}", op.as_str()),
             Command::Duplicate => "duplicate".into(),
         }
     }
@@ -108,11 +112,18 @@ pub fn decode(line: &str) -> anyhow::Result<Command> {
         "toggle-special" => Command::ToggleSpecial,
         "drawer" => {
             let name = match arg {
-                Some(a) if a == "close" => None,
+                Some("close") | None => None,
                 Some(a) => Some(a.to_string()),
-                None => None,
             };
-            Command::Drawer(name)
+            // The verb is the third token, after the name. `drawer volume` and
+            // `drawer volume open` both work; absent means toggle, which is
+            // what a bare `lume drawer volume` should mean.
+            let op = match parts.next() {
+                None => intent::DrawerOp::Toggle,
+                Some(word) => intent::DrawerOp::parse(word)
+                    .context("usage: lume drawer [name] [open|close|toggle]")?,
+            };
+            Command::Drawer(name, op)
         }
         "wallpaper" => {
             // `arg`, not `parts.next()`: the second token was already
@@ -282,11 +293,18 @@ pub fn handle(
                 "error: shell is shutting down".into()
             }
         }
-        Command::Drawer(name) => {
+        Command::Drawer(name, op) => {
             let Some(tx) = intents else {
                 return "error: no shell attached".into();
             };
-            let intent = intent::Intent::Drawer { widget: name, anchor_x: None };
+            let intent = intent::Intent::Drawer {
+                widget: name,
+                // No pointer on the CLI path. Right is the default because the
+                // bar's status cluster lives there; a left-docked request is
+                // an explicit third token.
+                anchor: intent::Anchor::Edge(intent::Edge::Right),
+                op,
+            };
             if tx.send(intent) {
                 "ok".to_string()
             } else {
@@ -360,6 +378,68 @@ mod tests {
         );
         assert_eq!(decode("toggle-special").unwrap(), Command::ToggleSpecial);
         assert_eq!(decode("quit").unwrap(), Command::Quit);
+    }
+
+    /// Every command must survive encode-then-decode. The wallpaper decoder read
+    /// the wrong token and silently made every wallpaper command a Toggle
+    /// while its own round-trip test still passed, because the test exercised
+    /// the encoding rather than the decoding.
+    #[test]
+    fn every_command_survives_a_round_trip() {
+        let commands = [
+            Command::Ping,
+            Command::Workspaces,
+            Command::FocusWorkspace(-2),
+            Command::ToggleSpecial,
+            Command::Quit,
+            Command::Panel(intent::Side::Left, Some(true)),
+            Command::Picker(intent::PickerOp::Toggle),
+            Command::Drawer(Some("volume".into()), intent::DrawerOp::Open),
+            Command::Drawer(Some("network".into()), intent::DrawerOp::Close),
+            Command::Launcher(intent::LauncherOp::Open),
+        ];
+
+        for cmd in commands {
+            let wire = cmd.wire();
+            let back = decode(&wire).unwrap_or_else(|e| panic!("{wire:?} did not decode: {e}"));
+            assert_eq!(cmd, back, "{wire:?} did not round trip");
+        }
+    }
+
+    /// The verb is the *third* token. Reading it from the wrong position is
+    /// what silently turned every wallpaper command into a toggle.
+    #[test]
+    fn the_drawer_verb_is_the_third_token() {
+        assert_eq!(
+            decode("drawer volume").unwrap(),
+            Command::Drawer(Some("volume".into()), intent::DrawerOp::Toggle)
+        );
+        assert_eq!(
+            decode("drawer volume open").unwrap(),
+            Command::Drawer(Some("volume".into()), intent::DrawerOp::Open)
+        );
+        // Naming a widget and closing it is legal: `Close` ignores the name,
+        // so this and a bare `close` do the same thing.
+        assert_eq!(
+            decode("drawer volume close").unwrap(),
+            Command::Drawer(Some("volume".into()), intent::DrawerOp::Close)
+        );
+        // A bare `close` is a name, not a verb: `close` in the name slot is
+        // ambiguous, so a nameless close must spell out its own verb.
+        assert_eq!(
+            decode("drawer close close").unwrap(),
+            Command::Drawer(None, intent::DrawerOp::Close)
+        );
+        assert_eq!(
+            decode("drawer close").unwrap(),
+            Command::Drawer(None, intent::DrawerOp::Toggle)
+        );
+        assert_eq!(
+            decode("drawer").unwrap(),
+            Command::Drawer(None, intent::DrawerOp::Toggle)
+        );
+        // An unknown verb is an error, not a silent default.
+        assert!(decode("drawer volume frobnicate").is_err());
     }
 
     #[test]

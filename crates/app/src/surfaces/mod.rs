@@ -401,18 +401,18 @@ impl gpui::Global for Ui {}
 /// Apply one intent. The only place outside a view that may change one.
 pub fn apply_intent(cx: &mut gpui::App, intent: intent::Intent) {
     match intent {
-        intent::Intent::Drawer { widget, anchor_x } => {
+        intent::Intent::Drawer { widget, anchor, op } => {
             let Some(ui) = cx.try_global::<Ui>() else {
                 tracing::warn!("drawer intent with no ui registered");
                 return;
             };
             let overlay = ui.overlay.clone();
-            let anchor_x = anchor_x.map(px);
             overlay.update(cx, |o, cx| match widget {
                 Some(name) => match menu::MenuId::parse(&name) {
-                    Some(which) => o.open_menu(which, anchor_x, cx),
+                    Some(which) => o.open_menu(which, anchor, op, cx),
                     None => tracing::warn!(%name, "no menu with that name"),
                 },
+                // A close request carries no widget: there is nothing to open.
                 None => o.close_menu(cx),
             });
         }

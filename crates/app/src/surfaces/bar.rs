@@ -45,6 +45,10 @@ const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(3000);
 pub struct Status {
     clock: String,
     network: String,
+    /// The SSID of the network this machine is on, or empty when wired or
+    /// down. The widget shows this beside the glyph rather than a byte rate:
+    /// which network you are on is the thing worth reading at a glance.
+    network_ssid: String,
     network_signal: Option<services::network::Signal>,
     volume: Option<services::volume::Volume>,
     battery: services::battery::Battery,
@@ -217,6 +221,15 @@ impl BarView {
                 let up = services::network::format_rate(rates.tx_per_sec);
                 let down = services::network::format_rate(rates.rx_per_sec);
                 format!("{down} {up}")
+            } else {
+                String::new()
+            };
+
+            // Only while wireless is actually up. `link()` shells out, and
+            // asking NetworkManager which network it is on when the radio is
+            // down buys a slower poll for an empty answer.
+            self.status.network_ssid = if self.status.network_up {
+                services::wifi::link().ssid
             } else {
                 String::new()
             };
@@ -444,7 +457,7 @@ impl Render for BarView {
                                     .border_1()
                                     .border_color(t.line())
                                     .px_2()
-                                    .py_1()
+                                    .h(px(self.shape.plate_h))
                             })
                             .child(
                         div()
@@ -536,7 +549,7 @@ impl Render for BarView {
                                     .border_1()
                                     .border_color(t.line())
                                     .px_2()
-                                    .py_1()
+                                    .h(px(self.shape.plate_h))
                             })
                             .children(right.iter().flat_map(|w| self.render_widget(w, &t))),
                     ),
@@ -585,11 +598,18 @@ impl BarView {
                 .id(("lume-bar-cell", hash_name(widget.key)))
                 .flex()
                 .items_center()
+                .justify_center()
                 .gap_1()
                 // Per-widget, from the registry. A digit and a wordmark want
                 // different amounts of room and one global gap makes both look
                 // slightly wrong — which is what it did.
                 .px(px(widget.pad))
+                // The cell is the widget's own invisible area: full plate
+                // height, so a 13px clock and a 20px identity mark have the same
+                // click target. Sized to content, the small ones were harder to
+                // hit than the large ones for no reason the user can see, and
+                // the hover highlight drew a box of visibly different heights.
+                .h(px(self.shape.plate_h))
                 .rounded(px(services::theme::radius::ROW))
                 .text_color(t.muted())
                 .child(content);
@@ -646,28 +666,58 @@ impl BarView {
             // micro label over the live number. It also fixes the flatness that
             // made the first version look like text somebody typed — a bare
             // "25%" says nothing about what is at 25%.
-            "network" if self.status.network_up => Some(tile(
-                "NET",
-                self.status.network.clone(),
-                t,
-            )),
+            // `tile` is content, not a cell. It has no `.id` and no `on_click`, so
+            // returning one directly produces a tile that looks clickable and
+            // is not — which is exactly what network and volume were. Every
+            // clickable widget has to go through `cell`.
+            //
+            // No `network_up` guard: a downed network used to render nothing,
+            // which left no way to reach the panel and reconnect. Showing the
+            // glyph with no SSID is the fix.
+            "network" => {
+                // Glyph by link quality, so the bar says something useful
+                // before the name is read. `bars()` is 0..=4, not 0..=3.
+                let glyph = match self.status.network_signal.as_ref().map(|s| s.bars()) {
+                    Some(b) if b >= 3 => "\u{f1eb}",
+                    Some(2) => "\u{f1ec}",
+                    Some(1) => "\u{f1ed}",
+                    // Zero bars and no reading at all share the off glyph: on a
+                    // wired link there is no strength to report, and drawing the
+                    // empty-wifi glyph would claim the radio is failing.
+                    _ if self.status.network_ssid.is_empty() && !self.status.network_up => {
+                        "\u{f1ee}"
+                    }
+                    _ => "\u{f1eb}",
+                };
+                // An SSID can be up to 32 bytes and the bar is a fixed height with a
+                // fixed budget. Elided rather than allowed to run into the
+                // volume glyph beside it.
+                let ssid = super::menu::truncate(&self.status.network_ssid, 18);
+                Some(cell(tile(
+                    glyph,
+                    (!ssid.is_empty()).then_some(ssid),
+                    t,
+                )))
+            }
+            // Icon only. The percentage moves on every wheel tick, and a
+            // number that flickers while the user is not looking at it is
+            // worse than none. Mute is carried by the glyph instead.
             "volume" => self.status.volume.as_ref().map(|v| {
-                tile("VOL", format!("{}%", v.percent()), t)
+                let glyph = if v.muted {
+                    "\u{f1e3}" // volume off
+                } else {
+                    "\u{f1e2}"
+                };
+                cell(tile(glyph, None, t))
             }),
-            "battery" => Some(cell(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(gpui::SharedString::from(
-                        self.status
-                            .battery
-                            .capacity
-                            .map(|p| format!("{p}%"))
-                            .unwrap_or_default(),
-                    ))
-                    .into_any_element(),
-            )),
+            "battery" => {
+                // Nothing to draw on a desktop, and an empty pill would claim
+                // a battery that is not there.
+                if !self.status.battery.present {
+                    return Vec::new();
+                }
+                Some(cell(battery_glyph(self.status.battery, t)))
+            }
             _ => None,
         }) else {
             return Vec::new();
@@ -723,29 +773,116 @@ fn identity_mark(t: &crate::theme::Palette) -> gpui::AnyElement {
 ///
 /// The box is what makes the bar look like instrumentation rather than like a
 /// row of numbers. It costs one border and it is the difference between the two.
-fn tile(caption: &'static str, value: String, t: &crate::theme::Palette) -> gpui::AnyElement {
-    div()
+/// A status widget: a glyph, optionally followed by a value.
+///
+/// One line, no border, no caption. The previous two-line boxed tile put a
+/// tracked-out `NET` above a byte rate, which made the bar's status end look
+/// like a set of framed readouts rather than a single instrument — and the
+/// border drew a hairline around each one, so the widgets read as separate
+/// objects rather than as one group.
+///
+/// `value: None` renders the glyph alone. Volume is not worth text at a
+/// glance: the speaker glyph plus the mute state is the information, and a
+/// number that changes on every wheel tick is noise next to it.
+fn tile(
+    glyph: &'static str,
+    value: Option<String>,
+    t: &crate::theme::Palette,
+) -> gpui::AnyElement {
+    let mut row = div()
         .flex()
-        .flex_col()
         .items_center()
-        .justify_center()
-        .gap_1()
-        .px_3()
+        .gap_1_5()
         .h_full()
-        .border_1()
-        .border_color(t.line_soft())
         .child(
             div()
-                .text_size(px(services::theme::type_scale::TINY))
-                .text_color(t.faint())
-                .letter_spacing(px(services::theme::type_scale::TRACK_MARK))
-                .child(caption),
-        )
-        .child(
+                .text_size(px(13.0))
+                .text_color(t.muted())
+                .child(gpui::SharedString::from(glyph)),
+        );
+
+    if let Some(value) = value {
+        row = row.child(
             div()
                 .text_size(px(services::theme::type_scale::SMALL))
-                .text_color(t.ink_a(1.0))
+                .text_color(t.ink_a(0.9))
                 .child(gpui::SharedString::from(value)),
+        );
+    }
+
+    row.into_any_element()
+}
+
+/// A drawn battery: an outlined cell with a proportional fill.
+///
+/// Not a Nerd Font glyph. A single glyph cannot express a level, and the
+/// level is the whole reason a battery indicator exists — `f240` is the same
+/// picture at 80% and at 9%. Ryoku draws the cell for the same reason.
+fn battery_glyph(b: services::battery::Battery, t: &crate::theme::Palette) -> gpui::AnyElement {
+    if !b.present {
+        return div().size_0().into_any_element();
+    }
+
+    let pct = b.capacity.unwrap_or(0) as f32 / 100.0;
+    let (body_w, body_h) = (16.0, 9.0);
+    let inset = 1.8;
+    let inner = body_w - inset * 2.0;
+
+    // Charging reads as accent rather than as a level: the number is climbing,
+    // so a static fraction would be wrong the instant it was drawn.
+    //
+    // Low also goes to accent, and that is the whole palette's fault rather
+    // than a shortcut: there is no danger colour, because NERV's accent *is*
+    // the warning red. A fourth hue here would fight it. The distinction the
+    // user needs is "pay attention now", which full-strength accent carries.
+    let fill = if b.charging || pct <= 0.2 {
+        t.accent_a(0.9)
+    } else {
+        t.ink_a(0.75)
+    };
+
+    div()
+        .relative()
+        .w(px(body_w + 3.0))
+        .h(px(body_h))
+        .flex()
+        .items_center()
+        // Body: transparent with a hairline border, so the fill inside reads as
+        // the charge rather than the outline reading as a full cell.
+        .child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(body_w))
+                .h(px(body_h))
+                .rounded(px(2.5))
+                .border_1()
+                .border_color(fill)
+                .child(
+                    // At least a sliver when non-empty: a 2% charge rendered at
+                    // 2% of 12px is invisible, which reads as empty.
+                    div()
+                        .absolute()
+                        .left(px(inset))
+                        .top(px(inset))
+                        .w(px((inner * pct).max(if pct > 0.0 { 1.5 } else { 0.0 })))
+                        .h(px(body_h - inset * 2.0))
+                        .rounded(px(1.2))
+                        .bg(fill),
+                ),
+        )
+        // The terminal nub. Present on every real cell, so it is part of the
+        // shape rather than a state.
+        .child(
+            div()
+                .absolute()
+                .left(px(body_w - 0.5))
+                .top(px(2.5))
+                .w(px(2.5))
+                .h(px(4.0))
+                .rounded(px(1.2))
+                .bg(fill),
         )
         .into_any_element()
 }
@@ -760,6 +897,14 @@ fn tile(caption: &'static str, value: String, t: &crate::theme::Palette) -> gpui
 /// `Islands` is deliberately absent. Clusters on different screen edges are the
 /// four-edge frame: a different surface model, not a shape. It used to be a
 /// variant that fell back to `Single` and logged, which is worse than not
+/// The height every region's plate gets in the bubbled bar.
+///
+/// Measured off the rightmost plate on a real bar, which carried the status
+/// cluster at 42px. A constant rather than a config value: the plates have to
+/// agree with each other, and making it configurable would restore the exact
+/// bug it fixes — one plate at a different height from the others.
+const PLATE_H: f32 = 42.0;
+
 /// offering it at all.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BarShape {
@@ -769,17 +914,31 @@ pub struct BarShape {
     /// One continuous surface behind the whole strip. When false, each region is
     /// its own rounded plate instead.
     pub continuous: bool,
+    /// Height of a region's plate, when this shape has plates.
+    ///
+    /// Explicit rather than derived from content. Each plate wrapped its
+    /// children in `py_1` and took whatever height they needed, so a column
+    /// holding the 20px identity mark and a column holding 13px clock text came
+    /// out at different heights — measured on a real bar at 44, 35 and 42 for
+    /// left, centre and right. Three plates at three heights read as three
+    /// unrelated objects rather than one instrument, and the eye reads the
+    /// tallest one as the important one.
+    ///
+    /// Sized from the rightmost plate: it carries the status cluster, which is
+    /// the densest content on the bar, so every other region has room for what
+    /// it holds.
+    pub plate_h: f32,
 }
 
 impl BarShape {
     pub fn of(style: BarStyle) -> Self {
         match style {
             // Flush with the output, one surface, no visible corners.
-            BarStyle::Single => Self { inset: 0.0, continuous: true },
+            BarStyle::Single => Self { inset: 0.0, continuous: true, plate_h: 0.0 },
             // Flush, no surface: the regions are the plates.
-            BarStyle::Bubbles => Self { inset: 0.0, continuous: false },
+            BarStyle::Bubbles => Self { inset: 0.0, continuous: false, plate_h: PLATE_H },
             // Lifted off both edges and fully rounded, one surface.
-            BarStyle::Framed => Self { inset: 10.0, continuous: true },
+            BarStyle::Framed => Self { inset: 10.0, continuous: true, plate_h: 0.0 },
         }
     }
 
@@ -815,7 +974,10 @@ impl Click {
             Click::Drawer(m) => {
                 services::intent::send(services::intent::Intent::Drawer {
                     widget: Some(m.name().to_string()),
-                    anchor_x: Some(anchor_x),
+                    // A click is the one path that has a real widget to point
+                    // at. Everything else docks to an edge.
+                    anchor: services::intent::Anchor::At(anchor_x),
+                    op: services::intent::DrawerOp::Toggle,
                 });
             }
             Click::Launcher => {

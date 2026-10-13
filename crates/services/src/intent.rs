@@ -53,18 +53,15 @@ pub enum Intent {
     SetPanel { side: Side, open: bool },
     /// Open, close or toggle the wallpaper picker.
     Picker(PickerOp),
-    /// Open the widget menu, or close it.
+    /// Open, close or toggle the widget menu.
     ///
-    /// The anchor is the widget's horizontal centre in screen coordinates, so
-    /// the popup can point at the cell that opened it. Carried in the intent
-    /// rather than re-derived, because the pointer position at click time is
-    /// the most accurate answer available and re-measuring later is not.
+    /// The anchor travels in the intent rather than being re-derived at open
+    /// time: the pointer position at click time is the most accurate answer
+    /// available, and re-measuring later is not.
     Drawer {
         widget: Option<String>,
-        /// Screen x of the widget's centre. , so this variant cannot
-        /// derive Eq - and it should not: a partialEq is all the tests need
-        /// and comparing floats for equality is a trap.
-        anchor_x: Option<f32>,
+        anchor: Anchor,
+        op: DrawerOp,
     },
     /// Open or close the launcher.
     ///
@@ -74,6 +71,46 @@ pub enum Intent {
     Launcher(LauncherOp),
     /// Quit the shell.
     Quit,
+}
+
+/// Where a popup should sit horizontally.
+///
+/// This was an `Option<f32>` holding a widget's centre, which made three
+/// different situations look like the same absence of data: a click on a
+/// widget, a keybind with no widget behind it, and an explicit request to
+/// dock to one edge. Naming them means a new caller has to pick one, and the
+/// renderer's fallback stops being a guess.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Anchor {
+    /// Screen x of the widget's centre, in pixels. The click path.
+    ///
+    /// A bare `f32` rather than a quantised enum, so this variant cannot
+    /// derive `Eq` — and it should not. A `PartialEq` is all the tests need,
+    /// and comparing floats for equality is a trap.
+    At(f32),
+    /// No pointer: dock to an edge.
+    ///
+    /// The keybind path. A popup that opened without a widget to point at has
+    /// to go somewhere, and which side matters for muscle memory — a keybind
+    /// should open near where the user is looking.
+    Edge(Edge),
+}
+
+/// The screen edge a popup docks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+}
+
+impl Edge {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(Edge::Left),
+            "right" => Some(Edge::Right),
+            _ => None,
+        }
+    }
 }
 
 /// What to do about the launcher.
@@ -90,6 +127,44 @@ impl LauncherOp {
             "off" | "close" => Some(LauncherOp::Close),
             // "toggle" is deliberately absent. See the variant's comment.
             _ => None,
+        }
+    }
+}
+
+/// What to do about the widget menu.
+///
+/// Unlike [`LauncherOp`] this does have a `Toggle`, because the click path
+/// genuinely wants one and the click path cannot auto-repeat. The keybind
+/// path is given the same verb by the binding generator, but Hyprland's
+/// key repeat only fires on held keys, and a held key re-entering the toggle
+/// is the exact failure `LauncherOp` refuses to allow. Bindings therefore
+/// use explicit verbs; see the `bindings` note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawerOp {
+    Open,
+    Close,
+    /// Show the named menu, or close it if that menu is already the open one.
+    ///
+    /// Toggling a *different* menu switches to it rather than closing — only
+    /// the menu that is actually open is ever dismissed.
+    Toggle,
+}
+
+impl DrawerOp {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "on" | "open" => Some(DrawerOp::Open),
+            "off" | "close" => Some(DrawerOp::Close),
+            "toggle" => Some(DrawerOp::Toggle),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DrawerOp::Open => "open",
+            DrawerOp::Close => "close",
+            DrawerOp::Toggle => "toggle",
         }
     }
 }

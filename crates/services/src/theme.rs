@@ -212,7 +212,15 @@ pub mod type_scale {
     /// The reference uses Fraunces for display and Space Grotesk for UI. This
     /// is the terminal look instead, so the whole interface is one family and
     /// there is no display/UI split to reason about.
-    pub const FAMILY: &str = "JetBrains Mono NF";
+    ///
+    /// Must match name ID 1 or 16 in the font's own `name` table, not a
+    /// human-readable spelling of it. The face installed here reports
+    /// `JetBrainsMono NF` (ID 1) and `JetBrainsMono Nerd Font` (ID 16), so
+    /// "JetBrains Mono NF" with different spacing resolves to nothing and every
+    /// glyph silently falls back to a default face. That fallback is a plain
+    /// mono, which looks close enough to the real thing that nothing is wrong
+    /// until a Nerd Font codepoint renders as tofu.
+    pub const FAMILY: &str = "JetBrainsMono NF";
 }
 
 /// Which theme the shell is wearing.
