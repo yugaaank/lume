@@ -644,6 +644,21 @@ impl Render for Desktop {
         // --- icons -------------------------------------------------------
         layer = layer
             .on_key_down(on_key)
+            .on_mouse_down(gpui::MouseButton::Left, {
+                let this = this.clone();
+                move |event: &gpui::MouseDownEvent, _w, cx| {
+                    let at = event.position;
+                    this.update(cx, |me, cx| {
+                        let hit = me.grid.cell_at(at);
+                        let has_icon = hit.map(|c| me.placed.iter().any(|(_, cell)| *cell == c)).unwrap_or(false);
+                        if has_icon {
+                            return;
+                        }
+                        me.menu_at = Some(at);
+                        cx.notify();
+                    });
+                }
+            })
             .on_mouse_down(gpui::MouseButton::Right, {
                 let this = this.clone();
                 move |event: &gpui::MouseDownEvent, _w, cx| {
