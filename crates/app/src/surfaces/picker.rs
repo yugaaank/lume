@@ -99,6 +99,9 @@ pub struct Picker {
     /// onward — so the picker opened, looked perfect, and its Close button
     /// did nothing. That is precisely the "can't close it" report.
     on_close: Option<Arc<dyn Fn(&mut App) + Send + Sync>>,
+    /// Called when a wallpaper tile is clicked, before setting the wallpaper.
+    /// Used by the overlay to mark that content was clicked so it doesn't dismiss.
+    on_content_click: Option<Arc<dyn Fn(&mut App) + Send + Sync>>,
 }
 
 impl Picker {
@@ -124,11 +127,16 @@ impl Picker {
             tile,
             columns,
             on_close: None,
+            on_content_click: None,
         }
     }
 
     pub fn set_on_close(&mut self, f: Arc<dyn Fn(&mut App) + Send + Sync>) {
         self.on_close = Some(f);
+    }
+
+    pub fn set_on_content_click(&mut self, f: Arc<dyn Fn(&mut App) + Send + Sync>) {
+        self.on_content_click = Some(f);
     }
 
     pub fn wallpapers(&self) -> &[PathBuf] {
@@ -350,6 +358,11 @@ fn tile_tile(
             let this = this.clone();
             let path = path.clone();
             move |_, _w, cx| {
+                // Notify the overlay that content was clicked so it doesn't dismiss.
+                let cb = this.read(cx).on_content_click.clone();
+                if let Some(cb) = cb {
+                    cb(cx);
+                }
                 if let Err(e) = super::background::set_wallpaper(&path) {
                     tracing::error!(path = %path.display(), "wallpaper failed: {e:#}");
                     return;

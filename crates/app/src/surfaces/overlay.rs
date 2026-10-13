@@ -61,6 +61,10 @@ pub struct Overlay {
     /// open. Focus is taken in `render` because `Context` has no way to focus
     /// without a `Window`, and `open_picker` does not have one.
     focused: bool,
+    /// Set to true when a click hits overlay content (picker tile, menu item,
+    /// launcher result). The dismiss handler checks this and only closes when
+    /// the click landed on the overlay background, not on content.
+    clicked_content: bool,
 }
 
 impl Overlay {
@@ -72,6 +76,7 @@ impl Overlay {
             launcher: None,
             display,
             focused: false,
+            clicked_content: false,
         }
     }
 
@@ -95,6 +100,7 @@ impl Overlay {
         launcher.update(cx, |l, _cx| {
             l.set_on_close(Arc::new(move |app| {
                 me.update(app, |o, cx| {
+                    o.clicked_content = true;
                     let _ = o.close(cx);
                 });
             }));
@@ -181,10 +187,17 @@ fn resolve_menu(
         // desktop cannot wire its own: the parent handle does not exist until
         // after `cx.new`.
         let me = cx.entity();
+        let me_for_click = me.clone();
         picker.update(cx, |p, _cx| {
             p.set_on_close(Arc::new(move |app| {
                 me.update(app, |o, cx| {
+                    o.clicked_content = true;
                     o.close(cx);
+                });
+            }));
+            p.set_on_content_click(Arc::new(move |app| {
+                me_for_click.update(app, |o, _cx| {
+                    o.clicked_content = true;
                 });
             }));
         });
@@ -301,14 +314,18 @@ impl Render for Overlay {
             // physical click that opened the menu meant the toggle always saw
             // an empty overlay and always re-opened. Clicking a widget to
             // close its own panel is the whole gesture, so the bar keeps it.
-            .on_mouse_down(gpui::MouseButton::Left, {
+            .on_click({
                 let this = cx.entity();
                 let bar_h = bar_height(cx);
-                move |event: &gpui::MouseDownEvent, _window: &mut Window, cx: &mut gpui::App| {
-                    if f32::from(event.position.y) < bar_h {
+                move |event: &gpui::ClickEvent, _window: &mut Window, cx: &mut gpui::App| {
+                    if f32::from(event.position().y) < bar_h {
                         return;
                     }
                     this.update(cx, |o, cx| {
+                        if o.clicked_content {
+                            o.clicked_content = false;
+                            return;
+                        }
                         o.close(cx);
                     });
                 }
@@ -465,6 +482,7 @@ fn menu_header(title: &'static str, this: &Entity<Overlay>) -> gpui::AnyElement 
                 .on_click({
                     let this = this.clone();
                     move |_, _w, cx| this.update(cx, |o, cx| {
+                        o.clicked_content = true;
                         let _ = o.close(cx);
                     })
                 }),
