@@ -20,6 +20,11 @@ pub const MIN_HEIGHT: f32 = 28.0;
 /// screen, and the exclusive zone silently costs every window a strip.
 pub const MAX_HEIGHT: f32 = 72.0;
 
+/// Single source of truth for the bar's visual spacing.
+/// Changing this one value adjusts outer margin, plate inset,
+/// widget cell padding, widget‑to‑widget gap, and bubble vertical breathing.
+const BAR_SPACING: f32 = 12.0;
+
 /// How often the clock is re-read.
 ///
 /// One second, because a clock with seconds needs it. Pure computation — no
@@ -362,10 +367,9 @@ impl Render for BarView {
         // nothing — the strip below is the visible bar, and it is the strip the
         // surface's input region describes.
         div().size_full().child(
-        // The shell. Three equal columns, each holding a row of floating pills.
-        // There is no continuous band behind them: the reference's islands mode
-        // hides the band and lets the wallpaper show between the pills, and a
-        // band would turn four plates into one bar with boxes drawn on it.
+        // The shell. Three equal columns, each holding a row of widgets.
+        // For continuous styles (Single/Framed), a band runs behind all widgets.
+        // For Bubbles, no band — pills float on the wallpaper.
         //
         // Equal columns, not `justify_between`, because with justify_between the
         // clock is only centred while the two outer groups happen to be the same
@@ -374,19 +378,64 @@ impl Render for BarView {
             .id("lume-bar")
             .h(px(self.height))
             .w_full()
-            // The reference's `shellOuterMargin`: pills are held off the screen
-            // edges by 5px. Without it the outer pills sit flush against x=0
-            // and their rounded corners and shadow are clipped.
-            .px(px(12.0))
             .flex()
             .items_center()
             .gap_3()
             .font_family(services::theme::type_scale::FAMILY)
             .text_color(t.ink_a(1.0))
             .text_size(px(services::theme::type_scale::WIDGET))
-            .child(self.render_row(&left, RowAlign::Start, &t))
-            .child(self.render_row(&middle, RowAlign::Centre, &t))
-            .child(self.render_row(&right, RowAlign::End, &t)),
+            .child(
+                // Continuous background band for Single / Framed.
+                div()
+                    .when(self.shape.continuous, |d| d
+                        .h(px(self.height))
+                        .w_full()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .bg(t.paper_a(services::theme::alpha::PILL))
+                        .when(self.shape.plate_h > 0.0, |d| {
+                            let radius = if self.shape.inset > 0.0 {
+                                services::theme::radius::CARD
+                            } else {
+                                services::theme::radius::CARET
+                            };
+                            d.border_1()
+                                .border_color(t.pill_border())
+                                .rounded(px(radius))
+                        })
+                    )
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_start()
+                    .px(px(BAR_SPACING))
+                    .child(self.render_row(&left, RowAlign::Start, &t, self.shape.continuous))
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(BAR_SPACING))
+                    .child(self.render_row(&middle, RowAlign::Centre, &t, self.shape.continuous))
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .px(px(BAR_SPACING))
+                    .child(self.render_row(&right, RowAlign::End, &t, self.shape.continuous))
+            ),
         )
             .into_any_element()
     }
@@ -425,10 +474,10 @@ fn pill(children: Vec<gpui::AnyElement>, t: &crate::theme::Palette, height: f32)
         .items_center()
         // Padding so the widgets (and their own margins) are never flush
         // with the bubble's edge — the background plate keeps its own space.
-        .px(px(8.0))
+        .px(px(BAR_SPACING))
         // Shorter than the bar so the pill has breathing room top and bottom,
         // instead of hugging the surface edge.
-        .h(px(height - 6.0))
+        .h(px(height - BREATHING))
         // A real gap between cells, on top of each cell's own margin. The
         // margin alone is the cell's padding and a widget's content sits inside
         // it; without the gap a wide value's margin is the only thing separating
@@ -454,7 +503,7 @@ const PILL_RADIUS: f32 = 6.0;
 /// Every widget's horizontal margin, in px. One value for all of them, so no
 /// widget can be given a different one by accident and two readouts can never
 /// end up touching.
-const WIDGET_PAD: f32 = 8.0;
+const WIDGET_PAD: f32 = BAR_SPACING;
 
 /// Clear space between two widgets' areas, on top of their margins.
 ///
@@ -462,15 +511,22 @@ const WIDGET_PAD: f32 = 8.0;
 /// run — the margin alone was the only thing between two readouts, and two of
 /// those and the status group looks like a sentence. 6 gives each widget a
 /// visibly separate area, which is the whole point of giving them areas.
-const WIDGET_GAP: f32 = 6.0;
+const WIDGET_GAP: f32 = BAR_SPACING - 6.0;
+
+/// Vertical breathing room inside the bubble pill – the bubble is shorter than
+/// the bar by this amount so it never hugs the surface edge.
+const BREATHING: f32 = BAR_SPACING - 6.0;
 
 impl BarView {
-    /// One sector: every widget in it inside a single bubble.
+    /// One sector: widgets laid out in a row.
+    /// If `continuous` is true (Single/Framed), widgets sit directly on the bar.
+    /// If false (Bubbles), they are wrapped in a pill per sector.
     fn render_row(
         &self,
         widgets: &[widgets::Widget],
         align: RowAlign,
         t: &crate::theme::Palette,
+        continuous: bool,
     ) -> gpui::AnyElement {
         let row = div().flex_1().h_full().flex().items_center().gap_3();
         let row = match align {
@@ -478,20 +534,23 @@ impl BarView {
             RowAlign::Centre => row.justify_center(),
             RowAlign::End => row.justify_end(),
         };
-        // One bubble per sector. The reference splits a sector into several
-        // pills at each separator; lume deliberately does not. A sector is one
-        // group, and splitting it turns the bar into a row of unrelated boxes —
-        // and it moves the seams every time a widget is added or removed,
-        // which is exactly when the user is trying to read the bar.
-        //
-        // One bubble per sector is also what makes placement visible: move a
-        // widget between sectors and it visibly joins a different group.
         let children: Vec<gpui::AnyElement> =
             widgets.iter().flat_map(|w| self.render_widget(w, t)).collect();
         if children.is_empty() {
             return row.into_any_element();
         }
-        row.child(pill(children, t, self.height)).into_any_element()
+        if continuous {
+            // Single / Framed: no pill wrapper, just widgets with gaps.
+            // The spacer ensures the last widget has trailing breathing room.
+            row.children(children)
+                .child(div().w(px(BAR_SPACING)).h(px(0.0)))
+                .into_any_element()
+        } else {
+            // Bubbles: wrap in a pill per sector.
+            row.child(pill(children, t, self.height))
+                .child(div().w(px(BAR_SPACING)).h(px(0.0)))
+                .into_any_element()
+        }
     }
 
     /// Render one widget. `Option` because a widget can be unavailable on this
@@ -527,33 +586,17 @@ impl BarView {
         };
 
         let cell = move |content: gpui::AnyElement| {
+            // In continuous modes (Single/Framed), plate_h is 0 — use bar height.
+            // In Bubbles, plate_h is the pill height (42).
+            let cell_h = if self.shape.continuous { self.height } else { self.shape.plate_h };
             let base = div()
                 .id(("lume-bar-cell", hash_name(widget.key)))
                 .flex()
                 .items_center()
                 .justify_center()
-                // One margin for every widget, symmetric. It used to be a
-                // per-widget `pad` field, which meant the margin was whatever
-                // each widget's entry happened to say — so a long value in one
-                // widget squeezed its neighbour's padding away and two readouts
-                // ended up touching. A single constant cannot drift, and every
-                // widget's area is identical, so moving one never rebalances
-                // the rest.
                 .px(px(WIDGET_PAD))
-                // Each cell keeps its natural width. A flex item shrinks to fit
-                // whatever is left, and a shrunk cell squeezes its own text into
-                // a wrap — which is how a long SSID turned the bar two lines
-                // tall. Cells are content-sized; the bar scrolls or elides
-                // before it squeezes.
                 .flex_shrink_0()
-                // The cell is the widget's own area: full plate height, so a 13px
-                // clock and a 20px mark have the same click target and the
-                // hover highlight draws a box of one height.
-                .h(px(self.shape.plate_h))
-                // Content is clipped to the cell. A value that grows — a long
-                // SSID, a media title — must elide inside its own area rather
-                // than spill over the widget next to it, which is what made the
-                // right-hand group read as one run-on smear.
+                .h(px(cell_h))
                 .overflow_hidden()
                 .rounded(px(services::theme::radius::ROW))
                 .text_color(t.muted())
@@ -911,11 +954,11 @@ impl BarShape {
     pub fn of(style: BarStyle) -> Self {
         match style {
             // Flush with the output, one surface, no visible corners.
-            BarStyle::Single => Self { inset: 8.0, continuous: true, plate_h: 0.0 },
+            BarStyle::Single => Self { inset: BAR_SPACING, continuous: true, plate_h: 0.0 },
             // Flush, no surface: the regions are the plates.
-            BarStyle::Bubbles => Self { inset: 8.0, continuous: false, plate_h: PLATE_H },
+            BarStyle::Bubbles => Self { inset: BAR_SPACING, continuous: false, plate_h: PLATE_H },
             // Lifted off both edges and fully rounded, one surface.
-            BarStyle::Framed => Self { inset: 10.0, continuous: true, plate_h: 0.0 },
+            BarStyle::Framed => Self { inset: BAR_SPACING + 2.0, continuous: true, plate_h: 0.0 },
         }
     }
 

@@ -55,14 +55,18 @@ fn icon(name: &str, fallback_label: &str, size: f32) -> AnyElement {
 pub struct Dock {
     focus: FocusHandle,
     items: Vec<DockItem>,
+    /// Running apps that aren't pinned — populated dynamically from the
+    /// compositor's window list so the dock shows both favourites and
+    /// currently-running programmes (ryoku behaviour).
+    running_items: Vec<DockItem>,
     hovered: Option<usize>,
     mode: DockMode,
     enabled: bool,
     trigger_px: f32,
     demand: Rc<DockDemand>,
     shown: bool,
-    /// Aligned with `items`. Recomputed on every compositor change, never per
-    /// frame.
+    /// Aligned with `items` + `running_items`. Recomputed on every compositor
+    /// change, never per frame.
     runs: Vec<Run>,
 }
 
@@ -91,7 +95,7 @@ impl Dock {
         w: gpui::Pixels,
         h: gpui::Pixels,
     ) -> gpui::Bounds<gpui::Pixels> {
-        let n = self.items.len() as f32;
+        let n = (self.items.len() + self.running_items.len()) as f32;
         let width = n * TILE + (n - 1.0).max(0.0) * TILE_GAP;
         let x = (f32::from(w) - width) / 2.0;
         gpui::Bounds::new(gpui::point(px(x), px(0.0)), gpui::size(px(width), h))
@@ -101,6 +105,12 @@ impl Dock {
 pub struct DockItem {
     pub app: AppEntry,
     pub pinned: bool,
+}
+
+impl PartialEq for DockItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.app.id == other.app.id && self.pinned == other.pinned
+    }
 }
 
 /// What the compositor says about one tile.
@@ -151,6 +161,7 @@ impl Dock {
         Self {
             focus: cx.focus_handle(),
             items,
+            running_items: Vec::new(),
             hovered: None,
             mode: dock.mode,
             enabled: dock.enabled,
@@ -203,28 +214,56 @@ impl Dock {
     /// decides both what a window counts towards and what a tile claims.
     fn refresh_runs(&mut self, cx: &mut Context<Self>) {
         let state = cx.global::<services::AppState>();
+
+        // Track runs for pinned items.
         let mut runs: Vec<Run> = self
             .items
             .iter()
-            .map(|item| Run::default())
+            .map(|_| Run::default())
             .collect();
-        let by_id: HashMap<&str, usize> = self
+        let pinned_by_id: HashMap<&str, usize> = self
             .items
             .iter()
             .enumerate()
             .map(|(i, item)| (item.app.id.as_str(), i))
             .collect();
 
+        // Track running (non-pinned) apps.
+        let mut running_by_id: HashMap<String, usize> = HashMap::new();
+        let mut running_items: Vec<DockItem> = Vec::new();
+
         for client in state.compositor.clients().iter() {
             let Some(app) = state.apps.by_class(&client.class) else {
-                // A window whose class matches no desktop entry lights nothing.
-                // Guessing here would light the wrong tile, which is worse than
-                // lighting none.
                 continue;
             };
-            let Some(slot) = by_id.get(app.id.as_str()) else { continue };
-            runs[*slot].count += 1;
-            runs[*slot].active |= client.active;
+            let app_id = app.id.clone();
+
+            // Pinned app — update its run.
+            if let Some(&slot) = pinned_by_id.get(app_id.as_str()) {
+                runs[slot].count += 1;
+                runs[slot].active |= client.active;
+                continue;
+            }
+
+            // Non-pinned running app — add to running list if new.
+            let slot = *running_by_id
+                .entry(app_id.clone())
+                .or_insert_with(|| {
+                    let idx = running_items.len();
+                    running_items.push(DockItem { app, pinned: false });
+                    idx
+                });
+            // Ensure runs vector has space for running items too.
+            if runs.len() <= self.items.len() + slot {
+                runs.resize(self.items.len() + running_items.len(), Run::default());
+            }
+            runs[self.items.len() + slot].count += 1;
+            runs[self.items.len() + slot].active |= client.active;
+        }
+
+        // Update running_items if changed.
+        if self.running_items != running_items {
+            self.running_items = running_items;
         }
 
         if self.runs != runs {
@@ -371,9 +410,21 @@ impl Render for Dock {
         }
         self.set_pointer(inside || self.hovered.is_some(), cx);
 
+        // Input region: only the tile row accepts clicks so icons work but
+        // clicks between/around them fall through to windows below.
+        let tiles = self.tiles_bounds(px(out_w), px(DOCK_HEIGHT));
+        window.set_input_region(Some(&[tiles]));
+
         let t = crate::theme::current(cx);
 
-        let buttons = self.items.iter().enumerate().map(|(i, item)| {
+        // Combine pinned + running items for rendering.
+        let all_items: Vec<&DockItem> = self
+            .items
+            .iter()
+            .chain(self.running_items.iter())
+            .collect();
+
+        let buttons = all_items.iter().enumerate().map(|(i, item)| {
             let app = item.app.clone();
             let run = self.runs.get(i).copied().unwrap_or_default();
             let is_hovered = self.hovered == Some(i);
@@ -438,7 +489,7 @@ impl Render for Dock {
                 // Two rules, not a filled corner and not an outline: a filled
                 // corner reads as a tab, and a whole-square outline reads as a
                 // second border competing with the plate's own.
-                .child(if run.active {
+                .child(if run.count > 0 {
                     div()
                         .absolute()
                         .left(px(4.0))
