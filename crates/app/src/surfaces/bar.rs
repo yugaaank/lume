@@ -401,10 +401,15 @@ impl Render for BarView {
             // A floating shell is detached from the screen edge, so it is
             // outlined all the way round. A flush one has only a bottom edge
             // that is not against the desktop.
+            //
+            // Both rules belong to the surface, so neither is drawn when there
+            // is no surface. `Bubbles` painted a full-width hairline across the
+            // desktop with nothing behind it: a border outlines a fill, and
+            // there was no fill to outline.
             .when(self.shape.floating(), |d| {
                 d.border_1().border_color(t.line())
             })
-            .when(!self.shape.floating(), |d| {
+            .when(!self.shape.floating() && self.shape.continuous, |d| {
                 d.border_b_1().border_color(t.line())
             })
             // The accent spine down the left edge, plus a matching tick at the
