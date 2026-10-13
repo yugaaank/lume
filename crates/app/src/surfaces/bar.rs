@@ -192,11 +192,11 @@ impl BarView {
         let volume = services::volume::read();
         self.status.volume = volume.clone();
 
-        if self.widgets.iter().any(|w| *w == widgets::Widget::Battery) {
+        if self.widgets.iter().any(|w| w.key == "battery") {
             self.status.battery = services::battery::Battery::read();
         }
 
-        if self.widgets.iter().any(|w| *w == widgets::Widget::Network) {
+        if self.widgets.iter().any(|w| w.key == "network") {
             let (interfaces, _) = self.rates.poll();
             let visible: Vec<_> = interfaces.iter().filter(|i| i.visible() && i.up).collect();
             self.status.network_up = !visible.is_empty();
@@ -462,26 +462,36 @@ impl BarView {
         // and a pointer cursor over something that does nothing is a lie the
         // user has to discover by clicking.
         //
-        // The clock is the exception to "drawer for every clickable widget": it
-        // opens the launcher. It was a placeholder drawer saying "nothing to
-        // configure yet", which is worse than no drawer — a time display is
-        // what people click to start doing things, and REQUIREMENTS.md says so
-        // explicitly.
-        let click = match widget {
-            widgets::Widget::Volume => Some(Click::Drawer(super::menu::MenuId::Volume)),
-            widgets::Widget::Network => Some(Click::Drawer(super::menu::MenuId::Network)),
-            widgets::Widget::Battery => Some(Click::Drawer(super::menu::MenuId::Battery)),
-            widgets::Widget::Clock => Some(Click::Launcher),
-            _ => None,
+        // What a click does, asked of the registry rather than of a table here.
+        //
+        // The widget says which popup it owns; this says how to open it. A
+        // widget with no popup is simply not clickable, and a new widget gets a
+        // click behaviour by declaring a popup id — not by being added to a
+        // match somewhere else.
+        //
+        // The clock is the exception: it opens the launcher. It was a
+        // placeholder drawer saying "nothing to configure yet", which is worse
+        // than no drawer — a time display is what people click to start doing
+        // things.
+        let click = match widget.popup.map(|p| p.id) {
+            // The clock declares a popup in the registry because it is a popup
+            // *slot* like any other, but its content is the launcher, so the id
+            // is not consulted here.
+            Some("clock") => Some(Click::Launcher),
+            Some(id) => super::menu::MenuId::parse(id).map(Click::Drawer),
+            None => None,
         };
 
         let cell = move |content: gpui::AnyElement| {
             let base = div()
-                .id(("lume-bar-cell", hash_name(widget.name())))
+                .id(("lume-bar-cell", hash_name(widget.key)))
                 .flex()
                 .items_center()
                 .gap_1()
-                .px_1()
+                // Per-widget, from the registry. A digit and a wordmark want
+                // different amounts of room and one global gap makes both look
+                // slightly wrong — which is what it did.
+                .px(px(widget.pad))
                 .rounded(px(services::theme::radius::ROW))
                 .text_color(t.muted())
                 .child(content);
@@ -507,7 +517,7 @@ impl BarView {
         // compositor's, not a `Status` field. Returning `None` from the match
         // and bailing there — which is what this did first — skipped the pips
         // entirely, because the early return came before the append.
-        if *widget == widgets::Widget::Workspaces {
+        if widget.key == "workspaces" {
             return vec![div()
                 .id("lume-bar-workspaces")
                 .flex()
@@ -516,19 +526,19 @@ impl BarView {
                 .into_any_element()];
         }
 
-        let Some(out) = (match widget {
+        let Some(out) = (match widget.key {
             // The clock is the bar's anchor and the only thing at full ink.
             // Everything else is muted or faint, which is what makes the centre
             // read as the centre rather than as just another widget.
-            widgets::Widget::Clock => Some(
+            "clock" => Some(
                 cell(div()
                     .text_size(px(services::theme::type_scale::CLOCK))
                     .text_color(t.ink_a(1.0))
                     .child(gpui::SharedString::from(self.status.clock.clone()))
                     .into_any_element()),
             ),
-            widgets::Widget::Workspaces => None,
-            widgets::Widget::Title => Some(cell(
+            "workspaces" => None,
+            "title" => Some(cell(
                 gpui::SharedString::from("lume").into_any_element(),
             )),
             // Status is a caption over a value, in a hairline box.
@@ -538,15 +548,15 @@ impl BarView {
             // micro label over the live number. It also fixes the flatness that
             // made the first version look like text somebody typed — a bare
             // "25%" says nothing about what is at 25%.
-            widgets::Widget::Network if self.status.network_up => Some(tile(
+            "network" if self.status.network_up => Some(tile(
                 "NET",
                 self.status.network.clone(),
                 t,
             )),
-            widgets::Widget::Volume => self.status.volume.as_ref().map(|v| {
+            "volume" => self.status.volume.as_ref().map(|v| {
                 tile("VOL", format!("{}%", v.percent()), t)
             }),
-            widgets::Widget::Battery => Some(cell(
+            "battery" => Some(cell(
                 div()
                     .flex()
                     .items_center()

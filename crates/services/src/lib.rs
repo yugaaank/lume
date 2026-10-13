@@ -16,6 +16,7 @@ pub mod theme;
 pub mod launcher;
 pub mod network;
 pub mod volume;
+pub mod widgets;
 pub mod wifi;
 pub mod ipc;
 
