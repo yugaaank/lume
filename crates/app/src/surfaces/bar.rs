@@ -420,6 +420,11 @@ fn pill(children: Vec<gpui::AnyElement>, t: &crate::theme::Palette, height: f32)
         .flex()
         .items_center()
         .h(px(height))
+        // A real gap between cells, on top of each cell's own margin. The
+        // margin alone is the cell's padding and a widget's content sits inside
+        // it; without the gap a wide value's margin is the only thing separating
+        // two readouts, and two of those and the bar looks like a sentence.
+        .gap(px(WIDGET_GAP))
         .rounded(px(PILL_RADIUS))
         .bg(t.paper_a(services::theme::alpha::PILL))
         .border_1()
@@ -430,6 +435,14 @@ fn pill(children: Vec<gpui::AnyElement>, t: &crate::theme::Palette, height: f32)
 
 /// The pill's corner radius. The reference's `barCornerRadius`.
 const PILL_RADIUS: f32 = 6.0;
+
+/// Every widget's horizontal margin, in px. One value for all of them, so no
+/// widget can be given a different one by accident and two readouts can never
+/// end up touching.
+const WIDGET_PAD: f32 = 8.0;
+
+/// Clear space between two widgets' areas, on top of their margins.
+const WIDGET_GAP: f32 = 2.0;
 
 impl BarView {
     /// One sector: every widget in it inside a single bubble.
@@ -499,17 +512,29 @@ impl BarView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .gap_1()
-                // Per-widget, from the registry. A digit and a wordmark want
-                // different amounts of room and one global gap makes both look
-                // slightly wrong — which is what it did.
-                .px(px(widget.pad))
-                // The cell is the widget's own invisible area: full plate
-                // height, so a 13px clock and a 20px identity mark have the same
-                // click target. Sized to content, the small ones were harder to
-                // hit than the large ones for no reason the user can see, and
-                // the hover highlight drew a box of visibly different heights.
+                // One margin for every widget, symmetric. It used to be a
+                // per-widget `pad` field, which meant the margin was whatever
+                // each widget's entry happened to say — so a long value in one
+                // widget squeezed its neighbour's padding away and two readouts
+                // ended up touching. A single constant cannot drift, and every
+                // widget's area is identical, so moving one never rebalances
+                // the rest.
+                .px(px(WIDGET_PAD))
+                // Each cell keeps its natural width. A flex item shrinks to fit
+                // whatever is left, and a shrunk cell squeezes its own text into
+                // a wrap — which is how a long SSID turned the bar two lines
+                // tall. Cells are content-sized; the bar scrolls or elides
+                // before it squeezes.
+                .flex_shrink_0()
+                // The cell is the widget's own area: full plate height, so a 13px
+                // clock and a 20px mark have the same click target and the
+                // hover highlight draws a box of one height.
                 .h(px(self.shape.plate_h))
+                // Content is clipped to the cell. A value that grows — a long
+                // SSID, a media title — must elide inside its own area rather
+                // than spill over the widget next to it, which is what made the
+                // right-hand group read as one run-on smear.
+                .overflow_hidden()
                 .rounded(px(services::theme::radius::ROW))
                 .text_color(t.muted())
                 .child(content);
@@ -593,7 +618,7 @@ impl BarView {
                     _ if self.status.network_ssid.is_empty() && !self.status.network_up => '\u{eb2f}',
                     _ => '\u{f1eb}',
                 };
-                let ssid = super::menu::truncate(&self.status.network_ssid, 16);
+                let ssid = self.status.network_ssid.clone();
                 Some(cell(tile(glyph, (!ssid.is_empty()).then_some(ssid), t)))
             }
             "volume" => self.status.volume.as_ref().map(|v| {
@@ -709,12 +734,32 @@ fn tile(glyph: char, value: Option<String>, t: &crate::theme::Palette) -> gpui::
             div()
                 .text_size(px(services::theme::type_scale::WIDGET))
                 .text_color(t.ink_a(1.0))
-                .child(gpui::SharedString::from(value)),
+                // Bounded by the string, not by the box. Capping the box with
+                // `max_w` made GPUI *wrap* the text onto a second line instead
+                // of eliding it, which is worse than the overflow it fixed: a
+                // two-line SSID breaks the bar's height and reads as a layout
+                // fault. So the characters are cut here, to a length that
+                // cannot exceed the cell, and the box is left to size itself.
+                //
+                // `flex_shrink_0` because a flex item otherwise shrinks to
+                // whatever width is left, and a shrunken value loses its last
+                // glyph to the cell's clip — which is how "SOMMY 1393" rendered
+                // as "SOMMY 139". A widget's area is content-sized.
+                .flex_shrink_0()
+                .child(gpui::SharedString::from(super::menu::truncate(
+                    &value,
+                    VALUE_MAX_CHARS,
+                ))),
         );
     }
 
     row.into_any_element()
 }
+
+/// The most characters a widget's value may show, so no value can be wide
+/// enough to reach its neighbour. 16 at 12px mono is ~115px, comfortably
+/// inside a third of the bar.
+const VALUE_MAX_CHARS: usize = 16;
 
 /// A drawn battery: an outlined cell with a proportional fill.
 ///

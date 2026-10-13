@@ -20,7 +20,7 @@
 //! read it. How it draws is the app crate's business, and the app matches on
 //! `key`.
 //!
-//! ## `pad` is applied, `has_fill` is not yet
+//! ## Padding is uniform, `has_fill` is not yet
 //!
 //! Only fields something reads are here. Per-widget fill and border flags, and
 //! the settings schema, are deliberately absent: they belong to the separator
@@ -67,9 +67,7 @@ pub struct PopupDef {
 
 /// One bar widget, as data.
 ///
-/// `Eq` and not just `PartialEq` even though `pad` is a float: nothing compares
-/// two pads for equality, and a derived `Eq` on a float is a claim the type does
-/// not need to make. Every use here is by key.
+/// Every use here is by key, which is what makes it the identity.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WidgetDef {
     /// The name written in `bar.widgets`. This is the identity, so renaming one
@@ -102,7 +100,6 @@ pub struct WidgetDef {
     ///
     /// Padding is per widget because a digit and a wordmark need different
     /// amounts of it, and one global gap makes both look wrong.
-    pub pad: f32,
     pub popup: Option<PopupDef>,
 }
 
@@ -125,7 +122,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         // `barSeps`, and it is what separates the launcher from the workspaces.
         gloss: "",
         side: Side::Left,
-        pad: 9.0,
         popup: Some(PopupDef { id: "launcher", pages: &[] }),
     },
     WidgetDef {
@@ -136,8 +132,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: false,
         gloss: "",
         side: Side::Left,
-        // The pip strip carries its own gaps, so it wants no extra padding.
-        pad: 0.0,
         // Drawn by the bar itself rather than by `render_widget`, but it is a
         // widget like any other for ordering and for the region split.
         popup: None,
@@ -150,7 +144,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: true,
         gloss: "",
         side: Side::Left,
-        pad: 9.0,
         popup: Some(PopupDef { id: "notification", pages: &[] }),
     },
     WidgetDef {
@@ -161,7 +154,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: true,
         gloss: "",
         side: Side::Left,
-        pad: 9.0,
         popup: None,
     },
     WidgetDef {
@@ -172,7 +164,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: false,
         gloss: "",
         side: Side::Left,
-        pad: 9.0,
         popup: Some(PopupDef { id: "volume", pages: &[] }),
     },
 
@@ -185,7 +176,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: true,
         gloss: "",
         side: Side::Middle,
-        pad: 9.0,
         popup: None,
     },
     WidgetDef {
@@ -198,7 +188,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         // date are one fact, not three.
         gloss: "",
         side: Side::Middle,
-        pad: 9.0,
         popup: Some(PopupDef { id: "clock", pages: &[] }),
     },
 
@@ -211,7 +200,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: true,
         gloss: "",
         side: Side::Right,
-        pad: 9.0,
         popup: None,
     },
     WidgetDef {
@@ -222,7 +210,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: false,
         gloss: "",
         side: Side::Right,
-        pad: 9.0,
         popup: Some(PopupDef { id: "network", pages: &[] }),
     },
     WidgetDef {
@@ -236,7 +223,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: false,
         gloss: "",
         side: Side::Right,
-        pad: 9.0,
         popup: Some(PopupDef { id: "battery", pages: &[] }),
     },
     WidgetDef {
@@ -247,7 +233,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: true,
         gloss: "",
         side: Side::Right,
-        pad: 9.0,
         popup: None,
     },
     WidgetDef {
@@ -258,7 +243,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: true,
         gloss: "",
         side: Side::Right,
-        pad: 9.0,
         popup: Some(PopupDef { id: "bluetooth", pages: &[] }),
     },
     WidgetDef {
@@ -269,7 +253,6 @@ pub const REGISTRY: &[WidgetDef] = &[
         ghost: true,
         gloss: "",
         side: Side::Right,
-        pad: 9.0,
         popup: None,
     },
 ];
